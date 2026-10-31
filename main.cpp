@@ -29,6 +29,11 @@ typedef void* (*FindPlayerPed_t)(int);
 static ApplyMoveForce_t ApplyMoveForce = NULL;
 static FindPlayerPed_t  FindPlayerPed  = NULL;
 static unsigned int*    pTimeMs        = NULL;
+struct RwV3d { float x, y, z; };
+typedef void* (*GetAnimHierarchyFromFrame_t)(void* frame);
+typedef void  (*GetBonePosition_t)(void* ped, RwV3d& out, unsigned int bone, bool b);
+static GetAnimHierarchyFromFrame_t GetAnimHierarchyFromFrame = NULL;
+static GetBonePosition_t           GetBonePosition           = NULL;
 
 static uintptr_t pGTASA = 0;
 static void*     hGTASA = NULL;
@@ -191,6 +196,38 @@ static HitMark g_hit[32];
 static int     g_hitN = 0;
 static int     g_hitLogs = 0;
 
+// ---- FASE 2.0: sonda del esqueleto (solo LEE, no modifica nada) ----
+static void ProbeSkeleton(void* ped)
+{
+    static int n = 0;
+    if(n++ >= 3) return;
+    void* clump = *(void**)((char*)ped + 0x18);               // CEntity::m_pRwObject
+    FLog("[skel] ped=%p clump=%p", ped, clump);
+    if(!ValidPtr(clump)) return;
+    void* frame = *(void**)((char*)clump + 4);                // RpClump.object.parent = RwFrame*
+    FLog("[skel] rwtype=%d frame=%p", (int)*(unsigned char*)clump, frame);
+    if(!ValidPtr(frame) || !GetAnimHierarchyFromFrame) return;
+    void* hier = GetAnimHierarchyFromFrame(frame);
+    FLog("[skel] hierarchy=%p", hier);
+    if(!ValidPtr(hier)) return;
+    unsigned int* h = (unsigned int*)hier;
+    FLog("[skel] hier: %08X %08X %08X %08X %08X %08X %08X %08X", h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+    float* m = *(float**)(h + 2);                                // pMatrixArray (RW 3.7)
+    if(ValidPtr(m))
+        FLog("[skel] m0: %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f",
+             m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
+    if(GetBonePosition)
+    {
+        static const unsigned bones[] = {1,2,3,4,5,8,22,32,41,51,43,53};
+        for(unsigned i = 0; i < sizeof(bones)/sizeof(bones[0]); ++i)
+        {
+            RwV3d v = {0,0,0};
+            GetBonePosition(ped, v, bones[i], false);
+            FLog("[skel] bone %u = (%.2f, %.2f, %.2f)", bones[i], v.x, v.y, v.z);
+        }
+    }
+}
+
 // Llamada desde los 3 puntos donde el juego procesa un golpe
 static void OnHit(const char* tag, void* ped, void* ev)
 {
@@ -222,6 +259,7 @@ static void OnHit(const char* tag, void* ped, void* ev)
         FLog("[%s] ped=%p weapon=%d force=%.1f pos=%d/%d atk(%.1f,%.1f) ped(%.1f,%.1f)",
              tag, ped, weapon, force, okP, okA, ap.x, ap.y, pp.x, pp.y);
 
+    if(force >= cfgLight) ProbeSkeleton(ped);
     if(force < cfgLight || !okP || !okA) return;
     float dx = pp.x - ap.x, dy = pp.y - ap.y;
     float len = sqrtf(dx*dx + dy*dy);
@@ -289,6 +327,8 @@ ON_MOD_LOAD()
 
     SETSYM_TO(ApplyMoveForce, hGTASA, "_ZN9CPhysical14ApplyMoveForceE7CVector");
     SETSYM_TO(FindPlayerPed,  hGTASA, "_Z13FindPlayerPedi");
+    SETSYM_TO(GetAnimHierarchyFromFrame, hGTASA, "_Z25GetAnimHierarchyFromFrameP7RwFrame");
+    SETSYM_TO(GetBonePosition,           hGTASA, "_ZN4CPed15GetBonePositionER5RwV3djb");
     SET_TO(pTimeMs, aml->GetSym(hGTASA, "_ZN6CTimer22m_snTimeInMillisecondsE"));
 
     const char* sC1 = "_ZN12CEventDamageC1EP7CEntityj11eWeaponType14ePedPieceTypeshbb";
