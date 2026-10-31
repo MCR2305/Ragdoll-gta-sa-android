@@ -1,0 +1,30 @@
+name: Build AML mod
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      aml_ref:
+        description: "Rama/tag de AndroidModLoader para las cabeceras (main por defecto)"
+        default: "main"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Descargar cabeceras de AML
+        run: |
+          REF="${{ github.event.inputs.aml_ref }}"
+          if [ -z "$REF" ]; then REF=main; fi
+          git clone https://github.com/RusJJ/AndroidModLoader aml
+          cd aml && git checkout "$REF" && cd ..
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r25c
+      - name: Compilar
+        run: |
+          ${{ steps.ndk.outputs.ndk-path }}/ndk-build NDK_PROJECT_PATH=. APP_BUILD_SCRIPT=Android.mk NDK_APPLICATION_MK=Application.mk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libGTA4RagdollAndroid
+          path: libs/armeabi-v7a/libGTA4RagdollAndroid.so
