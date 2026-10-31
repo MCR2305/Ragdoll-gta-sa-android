@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en-US">
+  <head>
+    <meta charset="UTF-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+
+<!-- Begin Jekyll SEO tag v2.8.0 -->
+<title>GTA4 Ragdoll Android - Fase 1 | Ragdoll-gta-sa-android</title>
+<meta name="generator" content="Jekyll v3.10.0" />
+<meta property="og:title" content="GTA4 Ragdoll Android - Fase 1" />
+<meta property="og:locale" content="en_US" />
+<meta name="description" content="a" />
+<meta property="og:description" content="a" />
+<link rel="canonical" href="https://mcr2305.github.io/Ragdoll-gta-sa-android/GTA4Ragdoll_Android/README_ES.html" />
+<meta property="og:url" content="https://mcr2305.github.io/Ragdoll-gta-sa-android/GTA4Ragdoll_Android/README_ES.html" />
+<meta property="og:site_name" content="Ragdoll-gta-sa-android" />
+<meta property="og:type" content="website" />
+<meta name="twitter:card" content="summary" />
+<meta property="twitter:title" content="GTA4 Ragdoll Android - Fase 1" />
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"WebPage","description":"a","headline":"GTA4 Ragdoll Android - Fase 1","url":"https://mcr2305.github.io/Ragdoll-gta-sa-android/GTA4Ragdoll_Android/README_ES.html"}</script>
+<!-- End Jekyll SEO tag -->
+
+    <link rel="stylesheet" href="/Ragdoll-gta-sa-android/assets/css/style.css?v=6832e1c2e59959d8386eba2b7004d12a91972895">
+    <!-- start custom head snippets, customize with your own _includes/head-custom.html file -->
+
+<!-- Setup Google Analytics -->
+
+
+
+<!-- You can set your favicon here -->
+<!-- link rel="shortcut icon" type="image/x-icon" href="/Ragdoll-gta-sa-android/favicon.ico" -->
+
+<!-- end custom head snippets -->
+
+  </head>
+  <body>
+    <div class="container-lg px-3 my-5 markdown-body">
+      
+      <h1><a href="https://mcr2305.github.io/Ragdoll-gta-sa-android/">Ragdoll-gta-sa-android</a></h1>
+      
+
+      <h1 id="gta4-ragdoll-android---fase-1">GTA4 Ragdoll Android - Fase 1</h1>
+
+<p>Mod AML para GTA SA 2.00 (armeabi-v7a). Esta fase NO es el ragdoll con huesos todavia:
+es la capa de reaccion (tambaleo hacia atras segun arma/vehiculo) + un log para ajustar todo.</p>
+
+<h2 id="compilar-sin-pc-github">Compilar sin PC (GitHub)</h2>
+<ol>
+  <li>Crea una cuenta en github.com y un repositorio nuevo (publico o privado).</li>
+  <li>Sube TODOS estos archivos respetando carpetas (main.cpp, Android.mk, Application.mk y
+.github/workflows/build.yml). Desde el navegador: “Add file &gt; Upload files”.</li>
+  <li>Pestaña “Actions”: se ejecuta solo al subir. Cuando termine (circulo verde), entra a la
+ejecucion y baja el artefacto “libGTA4RagdollAndroid” (es un zip con el .so).</li>
+  <li>Si falla, copia el mensaje de error del paso “Compilar” y mandamelo.</li>
+</ol>
+
+<h2 id="instalar">Instalar</h2>
+<p>Copia <code class="language-plaintext highlighter-rouge">libGTA4RagdollAndroid.so</code> a:
+<code class="language-plaintext highlighter-rouge">Android/data/com.rockstargames.gtasa/mods/</code>
+Abre el juego una vez; se crea el .ini de configuracion en la carpeta de config de AML.</p>
+
+<h2 id="probar">Probar</h2>
+<p>Dispara a un peaton y mira <code class="language-plaintext highlighter-rouge">Android/data/com.rockstargames.gtasa/files/GTA4Ragdoll.log</code>.
+Mandame ese archivo: las lineas “[dmg]” dicen el arma detectada, la fuerza y las posiciones.
+Si el .so no carga (el juego se cierra al abrir), dime tu version de AML: las cabeceras deben
+coincidir (tu APK trae AML 1.3.0). En el workflow puedes poner la rama/tag correcta en “aml_ref”.</p>
+
+
+      
+    </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/anchor-js/4.1.0/anchor.min.js" integrity="sha256-lZaRhKri35AyJSypXXs4o6OPFTbTmUoltBbDCbdzegg=" crossorigin="anonymous"></script>
+    <script>anchors.add();</script>
+  </body>
+</html>
