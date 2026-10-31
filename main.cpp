@@ -132,12 +132,48 @@ static void StartStagger(void* ped, float dx, float dy, float force)
 }
 
 // ---------------------------------------------------------------- hooks
-DECL_HOOKv(CEventDamage_ctor, void* self, void* attacker, unsigned int t, int weapon, int piece, unsigned char dir, bool b1, bool b2)
+static int g_ctorCalls = 0, g_copyCalls = 0;
+
+static void RecordEvent(void* self, void* attacker, int weapon, int piece)
 {
-    CEventDamage_ctor(self, attacker, t, weapon, piece, dir, b1, b2);
     DmgRec& r = g_rec[g_recN++ & 15];
     r.self = self; r.attacker = attacker; r.weapon = weapon; r.piece = piece;
     r.time = pTimeMs ? *pTimeMs : 0;
+    if(g_ctorCalls++ < 12) FLog("[ctor] evento=%p attacker=%p weapon=%d piece=%d", self, attacker, weapon, piece);
+}
+
+DECL_HOOKv(CEventDamage_ctor, void* self, void* attacker, unsigned int t, int weapon, int piece, unsigned char dir, bool b1, bool b2)
+{
+    CEventDamage_ctor(self, attacker, t, weapon, piece, dir, b1, b2);
+    RecordEvent(self, attacker, weapon, piece);
+}
+DECL_HOOKv(CEventDamage_ctor2, void* self, void* attacker, unsigned int t, int weapon, int piece, unsigned char dir, bool b1, bool b2)
+{
+    CEventDamage_ctor2(self, attacker, t, weapon, piece, dir, b1, b2);
+    RecordEvent(self, attacker, weapon, piece);
+}
+
+// el juego copia el evento: pasamos el registro al objeto nuevo
+static void CopyRecord(void* self, void* src)
+{
+    for(int i = 0; i < 16; ++i)
+        if(g_rec[i].self == src)
+        {
+            DmgRec n = g_rec[i]; n.self = self;
+            g_rec[g_recN++ & 15] = n;
+            if(g_copyCalls++ < 12) FLog("[copy] %p <- %p weapon=%d", self, src, n.weapon);
+            return;
+        }
+}
+DECL_HOOKv(CEventDamage_copy, void* self, void* src)
+{
+    CEventDamage_copy(self, src);
+    CopyRecord(self, src);
+}
+DECL_HOOKv(CEventDamage_copy2, void* self, void* src)
+{
+    CEventDamage_copy2(self, src);
+    CopyRecord(self, src);
 }
 
 DECL_HOOKv(CEventDamage_ComputeDamageAnim, void* self, void* ped, bool b)
@@ -149,7 +185,24 @@ DECL_HOOKv(CEventDamage_ComputeDamageAnim, void* self, void* ped, bool b)
     // buscar el registro de este evento
     DmgRec* rec = NULL;
     for(int i = 0; i < 16; ++i) if(g_rec[i].self == self) rec = &g_rec[i];
-    if(!rec) { FLog("[dmg] sin registro para evento %p", self); return; }
+    if(!rec)
+    {
+        // plan B: el registro mas reciente (ultimo segundo)
+        unsigned int now = pTimeMs ? *pTimeMs : 0;
+        for(int k = 1; k <= 16 && !rec; ++k)
+        {
+            DmgRec& c = g_rec[(g_recN - k) & 15];
+            if(c.self && now - c.time < 1000) rec = &c;
+        }
+        static int dumps = 0;
+        if(dumps++ < 6)
+        {
+            unsigned int* w = (unsigned int*)self;
+            FLog("[dump] evento=%p fallback=%d  %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X",
+                 self, rec ? 1 : 0, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11]);
+        }
+        if(!rec) return;
+    }
 
     float force = BaseForce(rec->weapon) * WeaponMult(rec->weapon);
     CVector pp, ap;
@@ -207,7 +260,17 @@ ON_MOD_LOAD()
     SETSYM_TO(FindPlayerPed,  hGTASA, "_Z13FindPlayerPedi");
     SET_TO(pTimeMs, aml->GetSym(hGTASA, "_ZN6CTimer22m_snTimeInMillisecondsE"));
 
-    HOOKSYM(CEventDamage_ctor,              hGTASA, "_ZN12CEventDamageC1EP7CEntityj11eWeaponType14ePedPieceTypeshbb");
+    const char* sC1 = "_ZN12CEventDamageC1EP7CEntityj11eWeaponType14ePedPieceTypeshbb";
+    const char* sC2 = "_ZN12CEventDamageC2EP7CEntityj11eWeaponType14ePedPieceTypeshbb";
+    const char* sK1 = "_ZN12CEventDamageC1ERKS_";
+    const char* sK2 = "_ZN12CEventDamageC2ERKS_";
+    uintptr_t aC1 = aml->GetSym(hGTASA, sC1), aC2 = aml->GetSym(hGTASA, sC2);
+    uintptr_t aK1 = aml->GetSym(hGTASA, sK1), aK2 = aml->GetSym(hGTASA, sK2);
+    FLog("[sym] ctor C1=%p C2=%p copy C1=%p C2=%p", (void*)aC1, (void*)aC2, (void*)aK1, (void*)aK2);
+    HOOKSYM(CEventDamage_ctor, hGTASA, sC1);
+    if(aC2 && aC2 != aC1) { HOOKSYM(CEventDamage_ctor2, hGTASA, sC2); }
+    HOOKSYM(CEventDamage_copy, hGTASA, sK1);
+    if(aK2 && aK2 != aK1) { HOOKSYM(CEventDamage_copy2, hGTASA, sK2); }
     HOOKSYM(CEventDamage_ComputeDamageAnim, hGTASA, "_ZN12CEventDamage17ComputeDamageAnimEP4CPedb");
     HOOKSYM(CPed_ProcessControl,            hGTASA, "_ZN4CPed14ProcessControlEv");
 
