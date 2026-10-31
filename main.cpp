@@ -176,46 +176,77 @@ DECL_HOOKv(CEventDamage_copy2, void* self, void* src)
     CopyRecord(self, src);
 }
 
-DECL_HOOKv(CEventDamage_ComputeDamageAnim, void* self, void* ped, bool b)
+// Layout de CEventDamage verificado con el volcado de tu log:
+//   +0x10 = atacante (CEntity*), +0x18 = eWeaponType, +0x1C = pieza del cuerpo
+static bool ReadEvent(void* ev, int& weapon, void*& attacker)
 {
-    CEventDamage_ComputeDamageAnim(self, ped, b);   // el juego elige su animacion normal
+    if(!ValidPtr(ev)) return false;
+    weapon   = *(int*)((char*)ev + 0x18);
+    attacker = *(void**)((char*)ev + 0x10);
+    return weapon >= 0 && weapon < 60;
+}
+
+struct HitMark { void* ped; unsigned int time; };
+static HitMark g_hit[32];
+static int     g_hitN = 0;
+static int     g_hitLogs = 0;
+
+// Llamada desde los 3 puntos donde el juego procesa un golpe
+static void OnHit(const char* tag, void* ped, void* ev)
+{
     if(!ValidPtr(ped) || !ApplyMoveForce) return;
     if(!cfgPlayer && FindPlayerPed && ped == FindPlayerPed(0)) return;
 
-    // buscar el registro de este evento
-    DmgRec* rec = NULL;
-    for(int i = 0; i < 16; ++i) if(g_rec[i].self == self) rec = &g_rec[i];
-    if(!rec)
+    unsigned int now = pTimeMs ? *pTimeMs : 0;
+    for(int i = 0; i < 32; ++i)                       // evitar procesar 2 veces el mismo golpe
+        if(g_hit[i].ped == ped && now - g_hit[i].time < 200) return;
+    g_hit[g_hitN++ & 31] = { ped, now };
+
+    int weapon = -1; void* attacker = NULL;
+    bool direct = ReadEvent(ev, weapon, attacker);
+    if(!direct)                                       // plan B: registro del constructor
     {
-        // plan B: el registro mas reciente (ultimo segundo)
-        unsigned int now = pTimeMs ? *pTimeMs : 0;
-        for(int k = 1; k <= 16 && !rec; ++k)
+        for(int k = 1; k <= 16; ++k)
         {
             DmgRec& c = g_rec[(g_recN - k) & 15];
-            if(c.self && now - c.time < 1000) rec = &c;
+            if(c.self && now - c.time < 1000) { weapon = c.weapon; attacker = c.attacker; direct = true; break; }
         }
-        static int dumps = 0;
-        if(dumps++ < 6)
-        {
-            unsigned int* w = (unsigned int*)self;
-            FLog("[dump] evento=%p fallback=%d  %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X %08X",
-                 self, rec ? 1 : 0, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11]);
-        }
-        if(!rec) return;
     }
+    if(!direct) return;
 
-    float force = BaseForce(rec->weapon) * WeaponMult(rec->weapon);
-    CVector pp, ap;
+    float force = BaseForce(weapon) * WeaponMult(weapon);
+    CVector pp = {0,0,0}, ap = {0,0,0};
     bool okP = GetPos(ped, pp);
-    bool okA = GetPos(rec->attacker, ap);
-    FLog("[dmg] ped=%p weapon=%d piece=%d force=%.1f pos=%d/%d (%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f)",
-         ped, rec->weapon, rec->piece, force, okP, okA, ap.x, ap.y, ap.z, pp.x, pp.y, pp.z);
+    bool okA = GetPos(attacker, ap);
+    if(g_hitLogs++ < 60)
+        FLog("[%s] ped=%p weapon=%d force=%.1f pos=%d/%d atk(%.1f,%.1f) ped(%.1f,%.1f)",
+             tag, ped, weapon, force, okP, okA, ap.x, ap.y, pp.x, pp.y);
 
     if(force < cfgLight || !okP || !okA) return;
     float dx = pp.x - ap.x, dy = pp.y - ap.y;
     float len = sqrtf(dx*dx + dy*dy);
     if(len < 0.01f) return;
     StartStagger(ped, dx / len, dy / len, force);
+}
+
+// CEventHandler::m_pPed esta en +0x00
+DECL_HOOK(int, CEH_ComputeDamageResponse, void* self, void* ev, void* a, void* b, void* c)
+{
+    int r = CEH_ComputeDamageResponse(self, ev, a, b, c);
+    if(ValidPtr(self)) OnHit("damage", *(void**)self, ev);
+    return r;
+}
+DECL_HOOK(int, CEH_ComputeDeathResponse, void* self, void* ev, void* a, void* b)
+{
+    int r = CEH_ComputeDeathResponse(self, ev, a, b);
+    if(ValidPtr(self)) OnHit("death", *(void**)self, ev);
+    return r;
+}
+DECL_HOOK(int, CEventDamage_ComputeDamageAnim, void* self, void* ped, bool b)
+{
+    int r = CEventDamage_ComputeDamageAnim(self, ped, b);
+    OnHit("anim", ped, self);
+    return r;
 }
 
 DECL_HOOKv(CPed_ProcessControl, void* self)
@@ -272,6 +303,8 @@ ON_MOD_LOAD()
     HOOKSYM(CEventDamage_copy, hGTASA, sK1);
     if(aK2 && aK2 != aK1) { HOOKSYM(CEventDamage_copy2, hGTASA, sK2); }
     HOOKSYM(CEventDamage_ComputeDamageAnim, hGTASA, "_ZN12CEventDamage17ComputeDamageAnimEP4CPedb");
+    HOOKSYM(CEH_ComputeDamageResponse, hGTASA, "_ZN13CEventHandler21ComputeDamageResponseEP6CEventP5CTaskS3_S3_");
+    HOOKSYM(CEH_ComputeDeathResponse,  hGTASA, "_ZN13CEventHandler20ComputeDeathResponseEP6CEventP5CTaskS3_");
     HOOKSYM(CPed_ProcessControl,            hGTASA, "_ZN4CPed14ProcessControlEv");
 
     FLog("=== GTA4 Ragdoll Android 0.1 cargado. base=0x%X ApplyMoveForce=%p FindPlayerPed=%p timer=%p",
