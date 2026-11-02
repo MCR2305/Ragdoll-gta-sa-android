@@ -43,7 +43,7 @@ static void*     hGTASA = NULL;
 // ---------------------------------------------------------------- config
 static float cfgLight   = 6.0f;    // fuerza minima para reaccionar
 static float cfgHeavy   = 22.0f;   // fuerza "fuerte" (tambaleo largo)
-static float cfgPush    = 0.55f;   // empuje por punto de fuerza
+static float cfgPush    = 0.08f;   // empuje por punto de fuerza (antes 0.55: lanzaba a los NPC muy lejos)
 static float cfgDecay   = 0.90f;   // cuanto baja el empuje cada frame
 static float cfgWeaponM = 1.0f;    // multiplicador armas
 static float cfgCarM    = 1.0f;    // multiplicador autos
@@ -140,7 +140,9 @@ static void StartStagger(void* ped, float dx, float dy, float force)
     g_st[slot].ped    = ped;
     g_st[slot].dx     = dx;
     g_st[slot].dy     = dy;
-    g_st[slot].power  = force * cfgPush;
+    float pw = force * cfgPush;
+    if(!(pw == pw) || pw > 3.0f) pw = 3.0f;          // sin NaN y con tope (evita lanzar al NPC fuera del mapa)
+    g_st[slot].power  = pw;
     g_st[slot].frames = (force >= cfgHeavy) ? 45 : 28;
 }
 
@@ -494,6 +496,40 @@ DECL_HOOK(void*, RpHAnimHierarchyUpdateMatrices_hook, void* hier)
     return r;
 }
 
+struct HitInfo { void* ped; float dx, dy, force; unsigned int time; };
+static HitInfo g_info[32];
+static int     g_infoN = 0;
+static void*   g_rdSeen[32];
+static int     g_rdSeenN = 0;
+static int     g_dieLogs = 0;
+
+// Se llama cada frame mientras el ped muere (CTaskSimpleDie) o esta muerto (CTaskSimpleDead)
+static void OnDying(const char* tag, void* ped, bool isDieTask)
+{
+    if(!cfgRagdoll || !pTimeMs || !ValidPtr(ped)) return;
+    for(int i = 0; i < 32; ++i) if(g_rdSeen[i] == ped) return;       // ya procesado
+    unsigned int now = *pTimeMs;
+    HitInfo* hi = NULL;
+    for(int i = 0; i < 32; ++i) if(g_info[i].ped == ped && now - g_info[i].time < 4000) hi = &g_info[i];
+    if(!hi && !isDieTask) return;                                    // cadaver viejo: no tocar
+    g_rdSeen[g_rdSeenN++ & 31] = ped;
+    float dx = hi ? hi->dx : 0.f, dy = hi ? hi->dy : 0.f, f = hi ? hi->force : 8.f;
+    if(f < 8.f) f = 8.f;
+    if(g_dieLogs++ < 30) FLog("[die] %s ped=%p dir=(%.2f,%.2f) force=%.1f info=%d", tag, ped, dx, dy, f, hi ? 1 : 0);
+    StartRagdoll(ped, dx, dy, f);
+}
+
+DECL_HOOK(int, CTaskSimpleDie_ProcessPed, void* self, void* ped)
+{
+    OnDying("die", ped, true);
+    return CTaskSimpleDie_ProcessPed(self, ped);
+}
+DECL_HOOK(int, CTaskSimpleDead_ProcessPed, void* self, void* ped)
+{
+    OnDying("dead", ped, false);
+    return CTaskSimpleDead_ProcessPed(self, ped);
+}
+
 // ---- FASE 2.0: sonda del esqueleto (solo LEE, no modifica nada) ----
 static void ProbeSkeleton(void* ped)
 {
@@ -559,6 +595,11 @@ static void OnHit(const char* tag, void* ped, void* ev)
         FLog("[%s] ped=%p weapon=%d force=%.1f pos=%d/%d atk(%.1f,%.1f) ped(%.1f,%.1f)",
              tag, ped, weapon, force, okP, okA, ap.x, ap.y, pp.x, pp.y);
 
+    {
+        float rx = 0.f, ry = 0.f;
+        if(okP && okA) { float dx = pp.x - ap.x, dy = pp.y - ap.y, l = sqrtf(dx*dx + dy*dy); if(l > 0.01f) { rx = dx / l; ry = dy / l; } }
+        g_info[g_infoN++ & 31] = { ped, rx, ry, force, now };
+    }
     if(isDeath && cfgRagdoll)
     {
         float rx = 0.f, ry = 0.f;
@@ -623,7 +664,7 @@ ON_MOD_LOAD()
 
     cfgLight   = cfg->GetFloat("LightForce",  6.0f,  "Settings");
     cfgHeavy   = cfg->GetFloat("HeavyForce",  22.0f, "Settings");
-    cfgPush    = cfg->GetFloat("PushPerForce", 0.55f, "Settings");
+    cfgPush    = cfg->GetFloat("PushForce", 0.08f, "Settings");
     cfgDecay   = cfg->GetFloat("Decay",       0.90f, "Settings");
     cfgWeaponM = cfg->GetFloat("WeaponMult",  1.0f,  "Settings");
     cfgCarM    = cfg->GetFloat("VehicleMult", 1.0f,  "Settings");
@@ -659,6 +700,8 @@ ON_MOD_LOAD()
     HOOKSYM(CEventDamage_ComputeDamageAnim, hGTASA, "_ZN12CEventDamage17ComputeDamageAnimEP4CPedb");
     HOOKSYM(CEH_ComputeDamageResponse, hGTASA, "_ZN13CEventHandler21ComputeDamageResponseEP6CEventP5CTaskS3_S3_");
     HOOKSYM(CEH_ComputeDeathResponse,  hGTASA, "_ZN13CEventHandler20ComputeDeathResponseEP6CEventP5CTaskS3_");
+    HOOKSYM(CTaskSimpleDie_ProcessPed,  hGTASA, "_ZN14CTaskSimpleDie10ProcessPedEP4CPed");
+    HOOKSYM(CTaskSimpleDead_ProcessPed, hGTASA, "_ZN15CTaskSimpleDead10ProcessPedEP4CPed");
     HOOKSYM(CPed_ProcessControl,            hGTASA, "_ZN4CPed14ProcessControlEv");
     HOOKSYM(RpHAnimHierarchyUpdateMatrices_hook, hGTASA, "_Z30RpHAnimHierarchyUpdateMatricesP16RpHAnimHierarchy");
 
