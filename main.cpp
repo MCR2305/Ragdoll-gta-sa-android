@@ -48,6 +48,7 @@ static float cfgCarM    = 1.0f;    // multiplicador autos
 static float cfgExplM   = 1.0f;    // multiplicador explosiones
 static bool  cfgPlayer  = false;   // tambien tambalear al jugador
 static bool  cfgLog     = true;
+static bool  cfgBoneTest = true;   // prueba visible: el ped "flota" 2.5 s tras un golpe
 
 // ---------------------------------------------------------------- log a archivo
 static int g_logLines = 0;
@@ -196,6 +197,54 @@ static HitMark g_hit[32];
 static int     g_hitN = 0;
 static int     g_hitLogs = 0;
 
+// ---- FASE 2.1: prueba de escritura de huesos ----
+static void* GetPedHierarchy(void* ped)
+{
+    void* clump = *(void**)((char*)ped + 0x18);
+    if(!ValidPtr(clump)) return NULL;
+    void* frame = *(void**)((char*)clump + 4);
+    if(!ValidPtr(frame) || !GetAnimHierarchyFromFrame) return NULL;
+    void* hier = GetAnimHierarchyFromFrame(frame);
+    return ValidPtr(hier) ? hier : NULL;
+}
+
+struct BoneTestRec { void* hier; unsigned int start; };
+static BoneTestRec g_bt[8];
+static int g_btN = 0;
+static int g_btLogs = 0;
+
+static void StartBoneTest(void* ped)
+{
+    void* h = GetPedHierarchy(ped);
+    if(!h) return;
+    unsigned int now = pTimeMs ? *pTimeMs : 0;
+    g_bt[g_btN++ & 7] = { h, now };
+    if(g_btLogs++ < 5) FLog("[bonetest] iniciado ped=%p hier=%p", ped, h);
+}
+
+typedef void* (*UpdMat_t)(void*);
+DECL_HOOK(void*, RpHAnimHierarchyUpdateMatrices_hook, void* hier)
+{
+    void* r = RpHAnimHierarchyUpdateMatrices_hook(hier);
+    if(!cfgBoneTest || !pTimeMs || !ValidPtr(hier)) return r;
+    unsigned int now = *pTimeMs;
+    for(int i = 0; i < 8; ++i)
+    {
+        if(g_bt[i].hier != hier) continue;
+        unsigned int dt = now - g_bt[i].start;
+        if(dt > 2500) { g_bt[i].hier = NULL; continue; }
+        unsigned int* h = (unsigned int*)hier;
+        unsigned int n = h[1];
+        float* m = *(float**)(h + 2);
+        if(!ValidPtr(m) || n == 0 || n > 64) continue;
+        float dz = 0.35f * sinf(dt * 0.008f);          // sube y baja ~0.35 m
+        for(unsigned int b = 0; b < n; ++b) m[b * 16 + 14] += dz;
+        static int wl = 0;
+        if(wl++ < 3) FLog("[bonetest] escribiendo %u huesos dz=%.2f", n, dz);
+    }
+    return r;
+}
+
 // ---- FASE 2.0: sonda del esqueleto (solo LEE, no modifica nada) ----
 static void ProbeSkeleton(void* ped)
 {
@@ -260,6 +309,7 @@ static void OnHit(const char* tag, void* ped, void* ev)
              tag, ped, weapon, force, okP, okA, ap.x, ap.y, pp.x, pp.y);
 
     if(force >= cfgLight) ProbeSkeleton(ped);
+    if(force >= cfgLight && cfgBoneTest) StartBoneTest(ped);
     if(force < cfgLight || !okP || !okA) return;
     float dx = pp.x - ap.x, dy = pp.y - ap.y;
     float len = sqrtf(dx*dx + dy*dy);
@@ -323,6 +373,7 @@ ON_MOD_LOAD()
     cfgExplM   = cfg->GetFloat("ExplosionMult", 1.0f, "Settings");
     cfgPlayer  = cfg->GetBool ("AffectPlayer", false, "Settings");
     cfgLog     = cfg->GetBool ("WriteLog",    true,  "Settings");
+    cfgBoneTest = cfg->GetBool("BoneTest",    true,  "Settings");
     cfg->Save();
 
     SETSYM_TO(ApplyMoveForce, hGTASA, "_ZN9CPhysical14ApplyMoveForceE7CVector");
@@ -346,6 +397,7 @@ ON_MOD_LOAD()
     HOOKSYM(CEH_ComputeDamageResponse, hGTASA, "_ZN13CEventHandler21ComputeDamageResponseEP6CEventP5CTaskS3_S3_");
     HOOKSYM(CEH_ComputeDeathResponse,  hGTASA, "_ZN13CEventHandler20ComputeDeathResponseEP6CEventP5CTaskS3_");
     HOOKSYM(CPed_ProcessControl,            hGTASA, "_ZN4CPed14ProcessControlEv");
+    HOOKSYM(RpHAnimHierarchyUpdateMatrices_hook, hGTASA, "_Z30RpHAnimHierarchyUpdateMatricesP16RpHAnimHierarchy");
 
     FLog("=== GTA4 Ragdoll Android 0.1 cargado. base=0x%X ApplyMoveForce=%p FindPlayerPed=%p timer=%p",
          (unsigned)pGTASA, (void*)ApplyMoveForce, (void*)FindPlayerPed, (void*)pTimeMs);
