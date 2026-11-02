@@ -52,7 +52,7 @@ static bool  cfgPlayer  = false;   // tambien tambalear al jugador
 static bool  cfgLog     = true;
 static bool  cfgRagdoll = true;     // ragdoll (Verlet) al morir
 static float cfgRdGravity = 14.0f;  // m/s^2
-static float cfgRdImpulse = 0.12f;  // m/s por punto de fuerza
+static float cfgRdImpulse = 0.30f;  // m/s por punto de fuerza
 static float cfgRdRadius  = 0.10f;  // radio de cada articulacion contra el suelo
 static float cfgRdDamp    = 0.992f; // amortiguacion por paso
 static bool  cfgBoneTest = false;   // prueba visible: el ped "flota" 2.5 s tras un golpe
@@ -310,10 +310,10 @@ static void RagdollInit(Ragdoll& r)
     for(unsigned i = 0; i < n; ++i)
     {
         int flags = *(int*)(ni + i*16 + 8);
+        if(flags & 2) { if(sp < RD_MAXN) stack[sp++] = cur; }      // PUSH: guarda el padre actual
         r.parent[i] = cur; r.child[i] = -1;
         cur = (int)i;
-        if(flags & 2) { if(sp < RD_MAXN) stack[sp++] = (int)i; }   // PUSH
-        if(flags & 1) { if(sp > 0) cur = stack[--sp]; }            // POP
+        if(flags & 1) { if(sp > 0) cur = stack[--sp]; }            // POP: vuelve al padre guardado
     }
     for(unsigned i = 0; i < n; ++i)
     {
@@ -328,12 +328,12 @@ static void RagdollInit(Ragdoll& r)
     {
         int pa = r.parent[i];
         r.grand[i] = (pa >= 0) ? r.parent[pa] : -1;
-        if(pa >= 0 && r.child[pa] < 0) r.child[pa] = (int)i;
         r.len[i] = 0; r.glen[i] = 0;
         if(pa >= 0)
         {
             float d[3] = { r.p0[i][0]-r.p0[pa][0], r.p0[i][1]-r.p0[pa][1], r.p0[i][2]-r.p0[pa][2] };
             r.len[i] = sqrtf(Dot3(d,d));
+            if(r.child[pa] < 0 || r.len[i] > r.len[r.child[pa]]) r.child[pa] = (int)i;
         }
         int g = r.grand[i];
         if(g >= 0)
@@ -674,7 +674,7 @@ ON_MOD_LOAD()
     cfgBoneTest = cfg->GetBool("BoneTest",    false, "Settings");
     cfgRagdoll  = cfg->GetBool ("Ragdoll",    true,  "Settings");
     cfgRdGravity = cfg->GetFloat("RagdollGravity", 14.0f, "Settings");
-    cfgRdImpulse = cfg->GetFloat("RagdollImpulse", 0.12f, "Settings");
+    cfgRdImpulse = cfg->GetFloat("RagdollForce", 0.30f, "Settings");
     cfgRdRadius  = cfg->GetFloat("RagdollRadius",  0.10f, "Settings");
     cfgRdDamp    = cfg->GetFloat("RagdollDamping", 0.992f, "Settings");
     cfg->Save();
