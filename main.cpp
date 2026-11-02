@@ -34,6 +34,8 @@ typedef void* (*GetAnimHierarchyFromFrame_t)(void* frame);
 typedef void  (*GetBonePosition_t)(void* ped, RwV3d& out, unsigned int bone, bool b);
 static GetAnimHierarchyFromFrame_t GetAnimHierarchyFromFrame = NULL;
 static GetBonePosition_t           GetBonePosition           = NULL;
+typedef float (*FindGroundZ3D_t)(float x, float y, float z, bool* found, void** ent);
+static FindGroundZ3D_t             FindGroundZFor3DCoord     = NULL;
 
 static uintptr_t pGTASA = 0;
 static void*     hGTASA = NULL;
@@ -48,7 +50,12 @@ static float cfgCarM    = 1.0f;    // multiplicador autos
 static float cfgExplM   = 1.0f;    // multiplicador explosiones
 static bool  cfgPlayer  = false;   // tambien tambalear al jugador
 static bool  cfgLog     = true;
-static bool  cfgBoneTest = true;   // prueba visible: el ped "flota" 2.5 s tras un golpe
+static bool  cfgRagdoll = true;     // ragdoll (Verlet) al morir
+static float cfgRdGravity = 14.0f;  // m/s^2
+static float cfgRdImpulse = 0.12f;  // m/s por punto de fuerza
+static float cfgRdRadius  = 0.10f;  // radio de cada articulacion contra el suelo
+static float cfgRdDamp    = 0.992f; // amortiguacion por paso
+static bool  cfgBoneTest = false;   // prueba visible: el ped "flota" 2.5 s tras un golpe
 
 // ---------------------------------------------------------------- log a archivo
 static int g_logLines = 0;
@@ -222,10 +229,252 @@ static void StartBoneTest(void* ped)
     if(g_btLogs++ < 5) FLog("[bonetest] iniciado ped=%p hier=%p", ped, h);
 }
 
+// ======================= FASE 2.2: RAGDOLL (Verlet) =======================
+// Una particula por hueso (posicion de la articulacion), restricciones de distancia
+// padre-hijo, gravedad y suelo. Despues se reescriben las matrices de los huesos.
+struct Quat { float x, y, z, w; };
+static inline float Dot3(const float* a, const float* b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
+static inline void  Cross3(const float* a, const float* b, float* o)
+{ o[0] = a[1]*b[2]-a[2]*b[1]; o[1] = a[2]*b[0]-a[0]*b[2]; o[2] = a[0]*b[1]-a[1]*b[0]; }
+
+static Quat QFromTo(const float* u, const float* v)
+{
+    float ul = sqrtf(Dot3(u,u)), vl = sqrtf(Dot3(v,v));
+    Quat id = {0,0,0,1};
+    if(ul < 1e-4f || vl < 1e-4f) return id;
+    float a[3] = { u[0]/ul, u[1]/ul, u[2]/ul }, b[3] = { v[0]/vl, v[1]/vl, v[2]/vl };
+    float d = Dot3(a,b);
+    float c[3]; Cross3(a, b, c);
+    if(d < -0.9999f)
+    {
+        float t[3] = { fabsf(a[0]) < 0.9f ? 1.f : 0.f, fabsf(a[0]) < 0.9f ? 0.f : 1.f, 0.f };
+        Cross3(a, t, c);
+        float cl = sqrtf(Dot3(c,c)); if(cl < 1e-6f) return id;
+        Quat q = { c[0]/cl, c[1]/cl, c[2]/cl, 0.f }; return q;
+    }
+    Quat q = { c[0], c[1], c[2], 1.f + d };
+    float l = sqrtf(q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w);
+    q.x /= l; q.y /= l; q.z /= l; q.w /= l;
+    return q;
+}
+static void QRot(const Quat& q, const float* w, float* out)
+{
+    float qv[3] = { q.x, q.y, q.z }, t[3], c[3];
+    Cross3(qv, w, t); t[0] *= 2; t[1] *= 2; t[2] *= 2;
+    Cross3(qv, t, c);
+    out[0] = w[0] + q.w*t[0] + c[0];
+    out[1] = w[1] + q.w*t[1] + c[1];
+    out[2] = w[2] + q.w*t[2] + c[2];
+}
+
+#define RD_MAXN 32
+struct Ragdoll
+{
+    bool  used, inited;
+    void* ped; void* hier;
+    unsigned int n, startTime, lastTime, lastCheck;
+    float dirx, diry, force;
+    float p[RD_MAXN][3], pv[RD_MAXN][3], p0[RD_MAXN][3], R0[RD_MAXN][9], gz[RD_MAXN];
+    int   parent[RD_MAXN], child[RD_MAXN], grand[RD_MAXN];
+    float len[RD_MAXN], glen[RD_MAXN];
+    int   stillFrames;
+};
+static Ragdoll g_rd[4];
+
+static void StartRagdoll(void* ped, float dx, float dy, float force)
+{
+    void* h = GetPedHierarchy(ped);
+    if(!h) return;
+    for(int i = 0; i < 4; ++i) if(g_rd[i].used && g_rd[i].hier == h) return;   // ya activo
+    int slot = -1;
+    for(int i = 0; i < 4; ++i) if(!g_rd[i].used) { slot = i; break; }
+    if(slot < 0) return;                                                         // maximo 4 a la vez
+    Ragdoll& r = g_rd[slot];
+    memset(&r, 0, sizeof(r));
+    r.used = true; r.ped = ped; r.hier = h;
+    r.dirx = dx; r.diry = dy; r.force = force;
+    FLog("[ragdoll] solicitado ped=%p hier=%p dir=(%.2f,%.2f) force=%.1f slot=%d", ped, h, dx, dy, force, slot);
+}
+
+static void RagdollInit(Ragdoll& r)
+{
+    unsigned int* h = (unsigned int*)r.hier;
+    unsigned int n = h[1];
+    float* m = *(float**)(h + 2);
+    unsigned char* ni = *(unsigned char**)(h + 4);          // RpHAnimNodeInfo[] (16 bytes c/u)
+    if(!ValidPtr(m) || !ValidPtr(ni) || n == 0 || n > RD_MAXN) { r.used = false; FLog("[ragdoll] jerarquia no valida n=%u", n); return; }
+    r.n = n;
+    int stack[RD_MAXN]; int sp = 0; int cur = -1;
+    for(unsigned i = 0; i < n; ++i)
+    {
+        int flags = *(int*)(ni + i*16 + 8);
+        r.parent[i] = cur; r.child[i] = -1;
+        cur = (int)i;
+        if(flags & 2) { if(sp < RD_MAXN) stack[sp++] = (int)i; }   // PUSH
+        if(flags & 1) { if(sp > 0) cur = stack[--sp]; }            // POP
+    }
+    for(unsigned i = 0; i < n; ++i)
+    {
+        float* mm = m + i*16;
+        r.p[i][0] = r.pv[i][0] = r.p0[i][0] = mm[12];
+        r.p[i][1] = r.pv[i][1] = r.p0[i][1] = mm[13];
+        r.p[i][2] = r.pv[i][2] = r.p0[i][2] = mm[14];
+        for(int k = 0; k < 3; ++k) { r.R0[i][k] = mm[k]; r.R0[i][3+k] = mm[4+k]; r.R0[i][6+k] = mm[8+k]; }
+        r.gz[i] = mm[14] - 1.0f;
+    }
+    for(unsigned i = 0; i < n; ++i)
+    {
+        int pa = r.parent[i];
+        r.grand[i] = (pa >= 0) ? r.parent[pa] : -1;
+        if(pa >= 0 && r.child[pa] < 0) r.child[pa] = (int)i;
+        r.len[i] = 0; r.glen[i] = 0;
+        if(pa >= 0)
+        {
+            float d[3] = { r.p0[i][0]-r.p0[pa][0], r.p0[i][1]-r.p0[pa][1], r.p0[i][2]-r.p0[pa][2] };
+            r.len[i] = sqrtf(Dot3(d,d));
+        }
+        int g = r.grand[i];
+        if(g >= 0)
+        {
+            float d[3] = { r.p0[i][0]-r.p0[g][0], r.p0[i][1]-r.p0[g][1], r.p0[i][2]-r.p0[g][2] };
+            r.glen[i] = sqrtf(Dot3(d,d));
+        }
+    }
+    // velocidad inicial: empuje del impacto, mas fuerte arriba para que el torso se incline
+    float pelvisZ = r.p0[0][2];
+    float speed = r.force * cfgRdImpulse * 0.02f;           // m/s -> desplazamiento por paso de 20 ms
+    for(unsigned i = 0; i < n; ++i)
+    {
+        float k = (r.p0[i][2] > pelvisZ + 0.25f) ? 1.4f : 1.0f;
+        r.pv[i][0] -= r.dirx * speed * k;
+        r.pv[i][1] -= r.diry * speed * k;
+        r.pv[i][2] -= 0.004f;
+    }
+    r.inited = true;
+    r.startTime = r.lastTime = pTimeMs ? *pTimeMs : 0;
+    FLog("[ragdoll] init n=%u", n);
+    for(unsigned i = 0; i < n; ++i)
+        FLog("[ragdoll]  nodo %u flags=%d padre=%d len=%.2f", i, *(int*)(ni + i*16 + 8), r.parent[i], r.len[i]);
+}
+
+static void RagdollStep(Ragdoll& r, float dt)
+{
+    unsigned n = r.n;
+    float g = cfgRdGravity * dt * dt;
+    float damp = cfgRdDamp;
+    for(unsigned i = 0; i < n; ++i)
+    {
+        for(int k = 0; k < 3; ++k)
+        {
+            float v = (r.p[i][k] - r.pv[i][k]) * damp;
+            r.pv[i][k] = r.p[i][k];
+            r.p[i][k] += v;
+        }
+        r.p[i][2] -= g;
+    }
+    // altura del suelo bajo cada articulacion
+    if(FindGroundZFor3DCoord)
+        for(unsigned i = 0; i < n; ++i)
+        {
+            bool found = false; void* ent = NULL;
+            float z = FindGroundZFor3DCoord(r.p[i][0], r.p[i][1], r.p[i][2] + 0.6f, &found, &ent);
+            if(found) r.gz[i] = z;
+        }
+    for(int it = 0; it < 6; ++it)
+    {
+        for(unsigned i = 0; i < n; ++i)
+        {
+            int pa = r.parent[i];
+            if(pa >= 0 && r.len[i] > 1e-4f)
+            {
+                float d[3] = { r.p[i][0]-r.p[pa][0], r.p[i][1]-r.p[pa][1], r.p[i][2]-r.p[pa][2] };
+                float l = sqrtf(Dot3(d,d)); if(l < 1e-5f) continue;
+                float f = (l - r.len[i]) / l * 0.5f;
+                for(int k = 0; k < 3; ++k) { r.p[i][k] -= d[k]*f; r.p[pa][k] += d[k]*f; }
+            }
+            int gr = r.grand[i];
+            if(gr >= 0 && r.glen[i] > 1e-4f)                  // evita que las extremidades se plieguen del todo
+            {
+                float minL = r.glen[i] * 0.55f;
+                float d[3] = { r.p[i][0]-r.p[gr][0], r.p[i][1]-r.p[gr][1], r.p[i][2]-r.p[gr][2] };
+                float l = sqrtf(Dot3(d,d));
+                if(l < minL && l > 1e-5f)
+                {
+                    float f = (l - minL) / l * 0.5f;
+                    for(int k = 0; k < 3; ++k) { r.p[i][k] -= d[k]*f; r.p[gr][k] += d[k]*f; }
+                }
+            }
+        }
+        for(unsigned i = 0; i < n; ++i)                        // suelo + friccion
+        {
+            float floorZ = r.gz[i] + cfgRdRadius;
+            if(r.p[i][2] < floorZ)
+            {
+                r.p[i][2] = floorZ;
+                r.pv[i][0] += (r.p[i][0] - r.pv[i][0]) * 0.25f;
+                r.pv[i][1] += (r.p[i][1] - r.pv[i][1]) * 0.25f;
+            }
+        }
+    }
+}
+
+static void RagdollWrite(Ragdoll& r)
+{
+    unsigned int* h = (unsigned int*)r.hier;
+    float* m = *(float**)(h + 2);
+    if(!ValidPtr(m)) return;
+    Quat q[RD_MAXN];
+    for(unsigned i = 0; i < r.n; ++i)
+    {
+        int c = r.child[i];
+        if(c >= 0)
+        {
+            float u[3] = { r.p0[c][0]-r.p0[i][0], r.p0[c][1]-r.p0[i][1], r.p0[c][2]-r.p0[i][2] };
+            float v[3] = { r.p[c][0]-r.p[i][0],   r.p[c][1]-r.p[i][1],   r.p[c][2]-r.p[i][2] };
+            q[i] = QFromTo(u, v);
+        }
+        else if(r.parent[i] >= 0) q[i] = q[r.parent[i]];
+        else { Quat id = {0,0,0,1}; q[i] = id; }
+        float* mm = m + i*16;
+        float o[3];
+        QRot(q[i], &r.R0[i][0], o); mm[0] = o[0]; mm[1] = o[1]; mm[2] = o[2];
+        QRot(q[i], &r.R0[i][3], o); mm[4] = o[0]; mm[5] = o[1]; mm[6] = o[2];
+        QRot(q[i], &r.R0[i][6], o); mm[8] = o[0]; mm[9] = o[1]; mm[10] = o[2];
+        mm[12] = r.p[i][0]; mm[13] = r.p[i][1]; mm[14] = r.p[i][2];
+    }
+}
+
+static void RagdollOnHierarchy(void* hier)
+{
+    unsigned int now = *pTimeMs;
+    for(int i = 0; i < 4; ++i)
+    {
+        Ragdoll& r = g_rd[i];
+        if(!r.used || r.hier != hier) continue;
+        if(!r.inited) { RagdollInit(r); if(!r.used) continue; }
+        if(now - r.lastCheck > 1000)                             // el ped sigue existiendo con esta misma jerarquia?
+        {
+            r.lastCheck = now;
+            if(GetPedHierarchy(r.ped) != r.hier) { FLog("[ragdoll] fin (ped liberado) slot=%d", i); r.used = false; continue; }
+        }
+        if(now != r.lastTime && now - r.lastTime < 200)
+        {
+            float dt = (now - r.lastTime) * 0.001f;
+            if(dt > 0.04f) dt = 0.04f;
+            RagdollStep(r, dt);
+            static int sl = 0;
+            if(sl++ < 8) FLog("[ragdoll] paso dt=%.3f pelvis=(%.2f,%.2f,%.2f) suelo=%.2f", dt, r.p[0][0], r.p[0][1], r.p[0][2], r.gz[0]);
+        }
+        r.lastTime = now;
+        RagdollWrite(r);
+    }
+}
+
 typedef void* (*UpdMat_t)(void*);
 DECL_HOOK(void*, RpHAnimHierarchyUpdateMatrices_hook, void* hier)
 {
     void* r = RpHAnimHierarchyUpdateMatrices_hook(hier);
+    if(cfgRagdoll && pTimeMs && ValidPtr(hier)) RagdollOnHierarchy(hier);
     if(!cfgBoneTest || !pTimeMs || !ValidPtr(hier)) return r;
     unsigned int now = *pTimeMs;
     for(int i = 0; i < 8; ++i)
@@ -284,8 +533,10 @@ static void OnHit(const char* tag, void* ped, void* ev)
     if(!cfgPlayer && FindPlayerPed && ped == FindPlayerPed(0)) return;
 
     unsigned int now = pTimeMs ? *pTimeMs : 0;
-    for(int i = 0; i < 32; ++i)                       // evitar procesar 2 veces el mismo golpe
-        if(g_hit[i].ped == ped && now - g_hit[i].time < 200) return;
+    bool isDeath = (tag[0] == 'd' && tag[1] == 'e' && tag[2] == 'a');
+    if(!isDeath)
+        for(int i = 0; i < 32; ++i)                   // evitar procesar 2 veces el mismo golpe
+            if(g_hit[i].ped == ped && now - g_hit[i].time < 200) return;
     g_hit[g_hitN++ & 31] = { ped, now };
 
     int weapon = -1; void* attacker = NULL;
@@ -308,6 +559,12 @@ static void OnHit(const char* tag, void* ped, void* ev)
         FLog("[%s] ped=%p weapon=%d force=%.1f pos=%d/%d atk(%.1f,%.1f) ped(%.1f,%.1f)",
              tag, ped, weapon, force, okP, okA, ap.x, ap.y, pp.x, pp.y);
 
+    if(isDeath && cfgRagdoll)
+    {
+        float rx = 0.f, ry = 0.f;
+        if(okP && okA) { float dx = pp.x - ap.x, dy = pp.y - ap.y, l = sqrtf(dx*dx + dy*dy); if(l > 0.01f) { rx = dx / l; ry = dy / l; } }
+        StartRagdoll(ped, rx, ry, force > 8.0f ? force : 8.0f);
+    }
     if(force >= cfgLight) ProbeSkeleton(ped);
     if(force >= cfgLight && cfgBoneTest) StartBoneTest(ped);
     if(force < cfgLight || !okP || !okA) return;
@@ -373,13 +630,19 @@ ON_MOD_LOAD()
     cfgExplM   = cfg->GetFloat("ExplosionMult", 1.0f, "Settings");
     cfgPlayer  = cfg->GetBool ("AffectPlayer", false, "Settings");
     cfgLog     = cfg->GetBool ("WriteLog",    true,  "Settings");
-    cfgBoneTest = cfg->GetBool("BoneTest",    true,  "Settings");
+    cfgBoneTest = cfg->GetBool("BoneTest",    false, "Settings");
+    cfgRagdoll  = cfg->GetBool ("Ragdoll",    true,  "Settings");
+    cfgRdGravity = cfg->GetFloat("RagdollGravity", 14.0f, "Settings");
+    cfgRdImpulse = cfg->GetFloat("RagdollImpulse", 0.12f, "Settings");
+    cfgRdRadius  = cfg->GetFloat("RagdollRadius",  0.10f, "Settings");
+    cfgRdDamp    = cfg->GetFloat("RagdollDamping", 0.992f, "Settings");
     cfg->Save();
 
     SETSYM_TO(ApplyMoveForce, hGTASA, "_ZN9CPhysical14ApplyMoveForceE7CVector");
     SETSYM_TO(FindPlayerPed,  hGTASA, "_Z13FindPlayerPedi");
     SETSYM_TO(GetAnimHierarchyFromFrame, hGTASA, "_Z25GetAnimHierarchyFromFrameP7RwFrame");
     SETSYM_TO(GetBonePosition,           hGTASA, "_ZN4CPed15GetBonePositionER5RwV3djb");
+    SETSYM_TO(FindGroundZFor3DCoord,     hGTASA, "_ZN6CWorld21FindGroundZFor3DCoordEfffPbPP7CEntity");
     SET_TO(pTimeMs, aml->GetSym(hGTASA, "_ZN6CTimer22m_snTimeInMillisecondsE"));
 
     const char* sC1 = "_ZN12CEventDamageC1EP7CEntityj11eWeaponType14ePedPieceTypeshbb";
