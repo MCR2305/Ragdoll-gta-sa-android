@@ -55,6 +55,8 @@ static float cfgRdGravity = 14.0f;  // m/s^2
 static float cfgRdImpulse = 0.30f;  // m/s por punto de fuerza
 static float cfgRdRadius  = 0.10f;  // radio de cada articulacion contra el suelo
 static float cfgRdDamp    = 0.992f; // amortiguacion por paso
+static float cfgRdBlendTime = 0.45f; // segundos que sigue la animacion del juego al empezar
+static float cfgRdBlend     = 0.55f; // fuerza de esa mezcla (0 = ragdoll puro)
 static bool  cfgBoneTest = false;   // prueba visible: el ped "flota" 2.5 s tras un golpe
 
 // ---------------------------------------------------------------- log a archivo
@@ -231,13 +233,14 @@ static void StartBoneTest(void* ped)
     if(g_btLogs++ < 5) FLog("[bonetest] iniciado ped=%p hier=%p", ped, h);
 }
 
-// ======================= FASE 2.2: RAGDOLL (Verlet) =======================
-// Una particula por hueso (posicion de la articulacion), restricciones de distancia
-// padre-hijo, gravedad y suelo. Despues se reescriben las matrices de los huesos.
+// ======================= FASE 2.2: RAGDOLL (Verlet con articulaciones) =======================
+// Esqueleto SA (32 nodos). Solo se simulan las articulaciones importantes (torso, cuello, cabeza,
+// brazos, piernas, pies). Dedos, cejas, mandibula y accesorios siguen rigidamente a su ancla.
 struct Quat { float x, y, z, w; };
 static inline float Dot3(const float* a, const float* b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; }
 static inline void  Cross3(const float* a, const float* b, float* o)
 { o[0] = a[1]*b[2]-a[2]*b[1]; o[1] = a[2]*b[0]-a[0]*b[2]; o[2] = a[0]*b[1]-a[1]*b[0]; }
+static inline void  Norm3(float* v) { float l = sqrtf(Dot3(v,v)); if(l > 1e-6f) { v[0]/=l; v[1]/=l; v[2]/=l; } }
 
 static Quat QFromTo(const float* u, const float* v)
 {
@@ -270,16 +273,60 @@ static void QRot(const Quat& q, const float* w, float* out)
 }
 
 #define RD_MAXN 32
+#define RD_MAXC 96
+
+// Tablas del esqueleto de ped de SA (verificadas con las banderas de tu log)
+static const int kParent[32] = {-1,0,1,2,3,4,5,5,5,4,9,10,11,12,13,4,15,16,17,18,19,3,3,2,1,24,25,26,1,28,29,30};
+static const int kAnchor[32] = {1,-1,-1,-1,-1,-1,5,5,5,-1,-1,-1,-1,12,12,-1,-1,-1,-1,18,18,3,3,2,-1,-1,-1,-1,-1,-1,-1,-1};
+// 0 = gira con el marco del torso, 1 = giro por segmento (swing), 2 = cabeza (torso + swing)
+static const int kKind[32]   = {0,0,0,0,0,2,0,0,0,0,1,1,1,0,0,0,1,1,1,0,0,0,0,0,1,1,1,1,1,1,1,1};
+static const int kPC[32]     = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,11,12,-1,-1,-1,-1,17,18,-1,-1,-1,-1,-1,-1,25,26,27,-1,29,30,31,-1};
+static const int kTorso[8]   = {1,2,3,4,9,15,24,28};   // cluster rigido del torso (+caderas)
+
+struct CDef { unsigned char a, b; float mn, mx; };
+static const CDef kC[] = {
+    {4,5,0.97f,1.03f}, {3,5,0.85f,1.15f}, {9,5,0.80f,1.20f}, {15,5,0.80f,1.20f},        // cuello / cabeza
+    {9,10,0.99f,1.01f}, {10,11,0.99f,1.01f}, {11,12,0.99f,1.01f},                       // brazo
+    {15,16,0.99f,1.01f}, {16,17,0.99f,1.01f}, {17,18,0.99f,1.01f},
+    {24,25,0.99f,1.01f}, {25,26,0.99f,1.01f}, {26,27,0.99f,1.01f},                      // pierna
+    {28,29,0.99f,1.01f}, {29,30,0.99f,1.01f}, {30,31,0.99f,1.01f},
+    {10,12,0.38f,1.00f}, {16,18,0.38f,1.00f},                                           // flexion del codo
+    {24,26,0.50f,1.00f}, {28,30,0.50f,1.00f},                                           // flexion de la rodilla
+    {25,27,0.72f,1.00f}, {29,31,0.72f,1.00f},                                           // tobillo
+    {1,25,0.79f,1.19f}, {1,29,0.79f,1.19f}                                              // cadera: las piernas no se cruzan por debajo del cuerpo
+};
+
+static inline bool IsActive(int i) { return kAnchor[i] < 0; }
+static inline bool InTorso(int i) { for(int k = 0; k < 8; ++k) if(kTorso[k] == i) return true; return false; }
+static float NodeRadius(int i)
+{
+    if(i >= 1 && i <= 4) return 0.13f;
+    if(i == 5) return 0.11f;
+    if(i == 9 || i == 15 || i == 24 || i == 28) return 0.09f;
+    if(i == 12 || i == 18) return 0.05f;
+    return 0.06f;
+}
+static float NodeInvMass(int i)
+{
+    if(i >= 1 && i <= 4) return 0.35f;
+    if(i == 9 || i == 15 || i == 24 || i == 28) return 0.5f;
+    if(i == 5) return 0.8f;
+    if(i == 12 || i == 18 || i == 27 || i == 31) return 1.4f;
+    return 1.0f;
+}
+
 struct Ragdoll
 {
     bool  used, inited;
     void* ped; void* hier;
     unsigned int n, startTime, lastTime, lastCheck;
     float dirx, diry, force;
-    float p[RD_MAXN][3], pv[RD_MAXN][3], p0[RD_MAXN][3], R0[RD_MAXN][9], gz[RD_MAXN];
-    int   parent[RD_MAXN], child[RD_MAXN], grand[RD_MAXN];
-    float len[RD_MAXN], glen[RD_MAXN];
-    int   stillFrames;
+    float p[RD_MAXN][3], pv[RD_MAXN][3], p0[RD_MAXN][3], R0[RD_MAXN][9], T[RD_MAXN][3], gz[RD_MAXN];
+    float rad[RD_MAXN], im[RD_MAXN];
+    int   nc; unsigned char ca[RD_MAXC], cb[RD_MAXC]; float cmn[RD_MAXC], cmx[RD_MAXC], cd0[RD_MAXC];
+    float F0[9];       // marco del torso al inicio: lateral, arriba, adelante
+    float fwd0[3];     // "adelante" del cuerpo al inicio
+    Quat  q[RD_MAXN];
 };
 static Ragdoll g_rd[4];
 
@@ -298,126 +345,195 @@ static void StartRagdoll(void* ped, float dx, float dy, float force)
     FLog("[ragdoll] solicitado ped=%p hier=%p dir=(%.2f,%.2f) force=%.1f slot=%d", ped, h, dx, dy, force, slot);
 }
 
+// marco del torso a partir de pelvis(1), columna alta(3) y caderas(24,28)
+static void TorsoFrame(const float P[][3], float* F)
+{
+    float u[3] = { P[3][0]-P[1][0], P[3][1]-P[1][1], P[3][2]-P[1][2] }; Norm3(u);
+    float l[3] = { P[28][0]-P[24][0], P[28][1]-P[24][1], P[28][2]-P[24][2] };
+    float d = Dot3(l, u); l[0] -= d*u[0]; l[1] -= d*u[1]; l[2] -= d*u[2]; Norm3(l);
+    float f[3]; Cross3(l, u, f); Norm3(f);
+    F[0]=l[0]; F[1]=l[1]; F[2]=l[2]; F[3]=u[0]; F[4]=u[1]; F[5]=u[2]; F[6]=f[0]; F[7]=f[1]; F[8]=f[2];
+}
+// rotacion del torso (marco inicial -> marco actual) aplicada a un vector
+static void ApplyTorso(const float* F0, const float* Fn, const float* v, float* o)
+{
+    o[0] = o[1] = o[2] = 0.f;
+    for(int a = 0; a < 3; ++a)
+    {
+        float k = Dot3(F0 + a*3, v);
+        o[0] += Fn[a*3+0]*k; o[1] += Fn[a*3+1]*k; o[2] += Fn[a*3+2]*k;
+    }
+}
+
 static void RagdollInit(Ragdoll& r)
 {
     unsigned int* h = (unsigned int*)r.hier;
     unsigned int n = h[1];
     float* m = *(float**)(h + 2);
     unsigned char* ni = *(unsigned char**)(h + 4);          // RpHAnimNodeInfo[] (16 bytes c/u)
-    if(!ValidPtr(m) || !ValidPtr(ni) || n == 0 || n > RD_MAXN) { r.used = false; FLog("[ragdoll] jerarquia no valida n=%u", n); return; }
-    r.n = n;
-    int stack[RD_MAXN]; int sp = 0; int cur = -1;
+    if(!ValidPtr(m) || !ValidPtr(ni) || n != 32) { r.used = false; FLog("[ragdoll] esqueleto inesperado n=%u", n); return; }
+    // comprobar que la jerarquia coincide con la tabla (banderas PUSH=2 / POP=1)
+    int stack[RD_MAXN]; int sp = 0; int cur = -1; bool ok = true;
     for(unsigned i = 0; i < n; ++i)
     {
         int flags = *(int*)(ni + i*16 + 8);
-        if(flags & 2) { if(sp < RD_MAXN) stack[sp++] = cur; }      // PUSH: guarda el padre actual
-        r.parent[i] = cur; r.child[i] = -1;
+        if(flags & 2) { if(sp < RD_MAXN) stack[sp++] = cur; }
+        if(cur != kParent[i]) ok = false;
         cur = (int)i;
-        if(flags & 1) { if(sp > 0) cur = stack[--sp]; }            // POP: vuelve al padre guardado
+        if(flags & 1) { if(sp > 0) cur = stack[--sp]; }
     }
+    if(!ok) { r.used = false; FLog("[ragdoll] la jerarquia no coincide con la tabla de SA"); return; }
+    r.n = n;
     for(unsigned i = 0; i < n; ++i)
     {
         float* mm = m + i*16;
-        r.p[i][0] = r.pv[i][0] = r.p0[i][0] = mm[12];
-        r.p[i][1] = r.pv[i][1] = r.p0[i][1] = mm[13];
-        r.p[i][2] = r.pv[i][2] = r.p0[i][2] = mm[14];
+        for(int k = 0; k < 3; ++k) { r.p[i][k] = r.pv[i][k] = r.p0[i][k] = mm[12+k]; r.T[i][k] = mm[12+k]; }
         for(int k = 0; k < 3; ++k) { r.R0[i][k] = mm[k]; r.R0[i][3+k] = mm[4+k]; r.R0[i][6+k] = mm[8+k]; }
         r.gz[i] = mm[14] - 1.0f;
+        r.rad[i] = NodeRadius((int)i); r.im[i] = NodeInvMass((int)i);
     }
-    for(unsigned i = 0; i < n; ++i)
+    // restricciones: cluster rigido del torso + tabla de articulaciones
+    r.nc = 0;
+    for(int x = 0; x < 8; ++x) for(int y = x + 1; y < 8; ++y)
     {
-        int pa = r.parent[i];
-        r.grand[i] = (pa >= 0) ? r.parent[pa] : -1;
-        r.len[i] = 0; r.glen[i] = 0;
-        if(pa >= 0)
-        {
-            float d[3] = { r.p0[i][0]-r.p0[pa][0], r.p0[i][1]-r.p0[pa][1], r.p0[i][2]-r.p0[pa][2] };
-            r.len[i] = sqrtf(Dot3(d,d));
-            if(r.child[pa] < 0 || r.len[i] > r.len[r.child[pa]]) r.child[pa] = (int)i;
-        }
-        int g = r.grand[i];
-        if(g >= 0)
-        {
-            float d[3] = { r.p0[i][0]-r.p0[g][0], r.p0[i][1]-r.p0[g][1], r.p0[i][2]-r.p0[g][2] };
-            r.glen[i] = sqrtf(Dot3(d,d));
-        }
+        int a = kTorso[x], b = kTorso[y];
+        float d[3] = { r.p0[b][0]-r.p0[a][0], r.p0[b][1]-r.p0[a][1], r.p0[b][2]-r.p0[a][2] };
+        r.ca[r.nc] = a; r.cb[r.nc] = b; r.cmn[r.nc] = 0.96f; r.cmx[r.nc] = 1.04f; r.cd0[r.nc] = sqrtf(Dot3(d,d)); ++r.nc;
     }
+    for(unsigned k = 0; k < sizeof(kC)/sizeof(kC[0]) && r.nc < RD_MAXC; ++k)
+    {
+        int a = kC[k].a, b = kC[k].b;
+        float d[3] = { r.p0[b][0]-r.p0[a][0], r.p0[b][1]-r.p0[a][1], r.p0[b][2]-r.p0[a][2] };
+        r.ca[r.nc] = a; r.cb[r.nc] = b; r.cmn[r.nc] = kC[k].mn; r.cmx[r.nc] = kC[k].mx; r.cd0[r.nc] = sqrtf(Dot3(d,d)); ++r.nc;
+    }
+    TorsoFrame(r.p0, r.F0);
+    // "adelante" del cuerpo: hacia donde apuntan los pies
+    r.fwd0[0] = (r.p0[27][0]-r.p0[26][0]) + (r.p0[31][0]-r.p0[30][0]);
+    r.fwd0[1] = (r.p0[27][1]-r.p0[26][1]) + (r.p0[31][1]-r.p0[30][1]);
+    r.fwd0[2] = 0.f;
+    if(Dot3(r.fwd0, r.fwd0) < 1e-6f) { r.fwd0[0] = r.F0[6]; r.fwd0[1] = r.F0[7]; r.fwd0[2] = r.F0[8]; }
+    Norm3(r.fwd0);
     // velocidad inicial: empuje del impacto, mas fuerte arriba para que el torso se incline
-    float pelvisZ = r.p0[0][2];
-    float speed = r.force * cfgRdImpulse * 0.02f;           // m/s -> desplazamiento por paso de 20 ms
+    float pelvisZ = r.p0[1][2];
+    float speed = r.force * cfgRdImpulse * 0.02f;
+    if(speed > 0.12f) speed = 0.12f;
     for(unsigned i = 0; i < n; ++i)
     {
+        if(!IsActive((int)i)) continue;
         float k = (r.p0[i][2] > pelvisZ + 0.25f) ? 1.4f : 1.0f;
         r.pv[i][0] -= r.dirx * speed * k;
         r.pv[i][1] -= r.diry * speed * k;
-        r.pv[i][2] -= 0.004f;
     }
     r.inited = true;
     r.startTime = r.lastTime = pTimeMs ? *pTimeMs : 0;
-    FLog("[ragdoll] init n=%u", n);
-    for(unsigned i = 0; i < n; ++i)
-        FLog("[ragdoll]  nodo %u flags=%d padre=%d len=%.2f", i, *(int*)(ni + i*16 + 8), r.parent[i], r.len[i]);
+    FLog("[ragdoll] init n=%u restricciones=%d", n, r.nc);
 }
 
-static void RagdollStep(Ragdoll& r, float dt)
+static void SolvePair(Ragdoll& r, int a, int b, float mn, float mx, float d0)
 {
-    unsigned n = r.n;
+    float d[3] = { r.p[b][0]-r.p[a][0], r.p[b][1]-r.p[a][1], r.p[b][2]-r.p[a][2] };
+    float l = sqrtf(Dot3(d,d)); if(l < 1e-6f) return;
+    float tgt;
+    if(l < mn*d0) tgt = mn*d0; else if(l > mx*d0) tgt = mx*d0; else return;
+    float diff = (l - tgt) / l;
+    float wa = r.im[a], wb = r.im[b], s = wa + wb;
+    for(int k = 0; k < 3; ++k) { r.p[a][k] += d[k]*diff*wa/s; r.p[b][k] -= d[k]*diff*wb/s; }
+}
+
+static void RagdollStep(Ragdoll& r, float dt, unsigned int now)
+{
     float g = cfgRdGravity * dt * dt;
-    float damp = cfgRdDamp;
-    for(unsigned i = 0; i < n; ++i)
+    float t = (now - r.startTime) * 0.001f;
+    float w = (cfgRdBlendTime > 0.001f) ? (1.0f - t / cfgRdBlendTime) : 0.f;
+    if(w < 0.f) w = 0.f;
+    w *= cfgRdBlend;
+    for(unsigned i = 0; i < r.n; ++i)
     {
+        if(!IsActive((int)i)) continue;
         for(int k = 0; k < 3; ++k)
         {
-            float v = (r.p[i][k] - r.pv[i][k]) * damp;
+            float v = (r.p[i][k] - r.pv[i][k]) * cfgRdDamp;
             r.pv[i][k] = r.p[i][k];
             r.p[i][k] += v;
         }
         r.p[i][2] -= g;
+        if(w > 0.f)                                   // al principio sigue la animacion del juego (intenta mantenerse)
+            for(int k = 0; k < 3; ++k) r.p[i][k] += (r.T[i][k] - r.p[i][k]) * 0.35f * w;
     }
-    // altura del suelo bajo cada articulacion
     if(FindGroundZFor3DCoord)
-        for(unsigned i = 0; i < n; ++i)
+        for(unsigned i = 0; i < r.n; ++i)
         {
+            if(!IsActive((int)i)) continue;
             bool found = false; void* ent = NULL;
             float z = FindGroundZFor3DCoord(r.p[i][0], r.p[i][1], r.p[i][2] + 0.6f, &found, &ent);
             if(found) r.gz[i] = z;
         }
-    for(int it = 0; it < 6; ++it)
+    for(int it = 0; it < 8; ++it)
     {
-        for(unsigned i = 0; i < n; ++i)
+        for(int c = 0; c < r.nc; ++c) SolvePair(r, r.ca[c], r.cb[c], r.cmn[c], r.cmx[c], r.cd0[c]);
+
+        // las rodillas solo se doblan hacia delante y los codos hacia atras
+        float Fn[9]; TorsoFrame(r.p, Fn);
+        float F[3]; ApplyTorso(r.F0, Fn, r.fwd0, F);
+        static const int legs[2][3] = { {24,25,26}, {28,29,30} };
+        static const int arms[2][3] = { {10,11,12}, {16,17,18} };
+        for(int s = 0; s < 2; ++s)
         {
-            int pa = r.parent[i];
-            if(pa >= 0 && r.len[i] > 1e-4f)
+            int H = legs[s][0], K = legs[s][1], A = legs[s][2];
+            float mid[3] = { (r.p[H][0]+r.p[A][0])*0.5f, (r.p[H][1]+r.p[A][1])*0.5f, (r.p[H][2]+r.p[A][2])*0.5f };
+            float dk[3] = { r.p[K][0]-mid[0], r.p[K][1]-mid[1], r.p[K][2]-mid[2] };
+            float off = Dot3(dk, F);
+            if(off < 0.f) for(int k = 0; k < 3; ++k) { float c = -off * F[k]; r.p[K][k] += c*0.5f; r.p[H][k] -= c*0.25f; r.p[A][k] -= c*0.25f; }
+            int S = arms[s][0], E = arms[s][1], Hd = arms[s][2];
+            float mid2[3] = { (r.p[S][0]+r.p[Hd][0])*0.5f, (r.p[S][1]+r.p[Hd][1])*0.5f, (r.p[S][2]+r.p[Hd][2])*0.5f };
+            float de[3] = { r.p[E][0]-mid2[0], r.p[E][1]-mid2[1], r.p[E][2]-mid2[2] };
+            float offE = Dot3(de, F) - 0.06f;
+            if(offE > 0.f) for(int k = 0; k < 3; ++k) { float c = offE * F[k]; r.p[E][k] -= c*0.5f; r.p[S][k] += c*0.25f; r.p[Hd][k] += c*0.25f; }
+        }
+
+        // volumen: las partes del cuerpo no se atraviesan entre si
+        for(int i = 1; i < 32; ++i)
+        {
+            if(!IsActive(i)) continue;
+            for(int j = i + 1; j < 32; ++j)
             {
-                float d[3] = { r.p[i][0]-r.p[pa][0], r.p[i][1]-r.p[pa][1], r.p[i][2]-r.p[pa][2] };
-                float l = sqrtf(Dot3(d,d)); if(l < 1e-5f) continue;
-                float f = (l - r.len[i]) / l * 0.5f;
-                for(int k = 0; k < 3; ++k) { r.p[i][k] -= d[k]*f; r.p[pa][k] += d[k]*f; }
-            }
-            int gr = r.grand[i];
-            if(gr >= 0 && r.glen[i] > 1e-4f)                  // evita que las extremidades se plieguen del todo
-            {
-                float minL = r.glen[i] * 0.55f;
-                float d[3] = { r.p[i][0]-r.p[gr][0], r.p[i][1]-r.p[gr][1], r.p[i][2]-r.p[gr][2] };
-                float l = sqrtf(Dot3(d,d));
-                if(l < minL && l > 1e-5f)
-                {
-                    float f = (l - minL) / l * 0.5f;
-                    for(int k = 0; k < 3; ++k) { r.p[i][k] -= d[k]*f; r.p[gr][k] += d[k]*f; }
-                }
+                if(!IsActive(j)) continue;
+                if(InTorso(i) && InTorso(j)) continue;
+                if(kParent[j] == i || kParent[i] == j) continue;
+                if((i == 5 && (InTorso(j))) || (j == 5 && InTorso(i))) continue;
+                if(kParent[kParent[j] < 0 ? 0 : kParent[j]] == i) continue;
+                float minD = (r.rad[i] + r.rad[j]) * 0.9f;
+                float d[3] = { r.p[j][0]-r.p[i][0], r.p[j][1]-r.p[i][1], r.p[j][2]-r.p[i][2] };
+                float l2 = Dot3(d,d);
+                if(l2 >= minD*minD || l2 < 1e-8f) continue;
+                float l = sqrtf(l2), diff = (l - minD) / l;
+                float wa = r.im[i], wb = r.im[j], s2 = wa + wb;
+                for(int k = 0; k < 3; ++k) { r.p[i][k] += d[k]*diff*wa/s2; r.p[j][k] -= d[k]*diff*wb/s2; }
             }
         }
-        for(unsigned i = 0; i < n; ++i)                        // suelo + friccion
+
+        // suelo + friccion (cada articulacion con su radio)
+        for(unsigned i = 0; i < r.n; ++i)
         {
-            float floorZ = r.gz[i] + cfgRdRadius;
+            if(!IsActive((int)i)) continue;
+            float floorZ = r.gz[i] + r.rad[i];
             if(r.p[i][2] < floorZ)
             {
                 r.p[i][2] = floorZ;
-                r.pv[i][0] += (r.p[i][0] - r.pv[i][0]) * 0.25f;
-                r.pv[i][1] += (r.p[i][1] - r.pv[i][1]) * 0.25f;
+                r.pv[i][0] += (r.p[i][0] - r.pv[i][0]) * 0.35f;
+                r.pv[i][1] += (r.p[i][1] - r.pv[i][1]) * 0.35f;
             }
         }
     }
+}
+
+// aplica al vector v la rotacion del nodo i (segun su tipo)
+static void NodeRotate(const Ragdoll& r, const float* Fn, int i, const float* v, float* o)
+{
+    int kind = kKind[i];
+    if(kind == 0) { ApplyTorso(r.F0, Fn, v, o); return; }
+    if(kind == 2) { float t[3]; ApplyTorso(r.F0, Fn, v, t); QRot(r.q[i], t, o); return; }
+    QRot(r.q[i], v, o);
 }
 
 static void RagdollWrite(Ragdoll& r)
@@ -425,24 +541,51 @@ static void RagdollWrite(Ragdoll& r)
     unsigned int* h = (unsigned int*)r.hier;
     float* m = *(float**)(h + 2);
     if(!ValidPtr(m)) return;
-    Quat q[RD_MAXN];
-    for(unsigned i = 0; i < r.n; ++i)
+    float Fn[9]; TorsoFrame(r.p, Fn);
+    // giros por segmento
+    for(int i = 0; i < 32; ++i)
     {
-        int c = r.child[i];
+        Quat id = {0,0,0,1};
+        r.q[i] = id;
+        if(!IsActive(i) || kKind[i] == 0) continue;
+        if(kKind[i] == 2)                                  // cabeza: direccion cuello->cabeza (ya con el giro del torso)
+        {
+            float u0[3] = { r.p0[5][0]-r.p0[4][0], r.p0[5][1]-r.p0[4][1], r.p0[5][2]-r.p0[4][2] }, u1[3];
+            ApplyTorso(r.F0, Fn, u0, u1);
+            float v[3] = { r.p[5][0]-r.p[4][0], r.p[5][1]-r.p[4][1], r.p[5][2]-r.p[4][2] };
+            r.q[i] = QFromTo(u1, v);
+            continue;
+        }
+        int c = kPC[i];
         if(c >= 0)
         {
             float u[3] = { r.p0[c][0]-r.p0[i][0], r.p0[c][1]-r.p0[i][1], r.p0[c][2]-r.p0[i][2] };
             float v[3] = { r.p[c][0]-r.p[i][0],   r.p[c][1]-r.p[i][1],   r.p[c][2]-r.p[i][2] };
-            q[i] = QFromTo(u, v);
+            r.q[i] = QFromTo(u, v);
         }
-        else if(r.parent[i] >= 0) q[i] = q[r.parent[i]];
-        else { Quat id = {0,0,0,1}; q[i] = id; }
+        else if(kParent[i] >= 0) r.q[i] = r.q[kParent[i]];  // extremos (manos, puntas del pie)
+    }
+    for(int i = 0; i < 32; ++i)
+    {
         float* mm = m + i*16;
         float o[3];
-        QRot(q[i], &r.R0[i][0], o); mm[0] = o[0]; mm[1] = o[1]; mm[2] = o[2];
-        QRot(q[i], &r.R0[i][3], o); mm[4] = o[0]; mm[5] = o[1]; mm[6] = o[2];
-        QRot(q[i], &r.R0[i][6], o); mm[8] = o[0]; mm[9] = o[1]; mm[10] = o[2];
-        mm[12] = r.p[i][0]; mm[13] = r.p[i][1]; mm[14] = r.p[i][2];
+        if(IsActive(i))
+        {
+            NodeRotate(r, Fn, i, &r.R0[i][0], o); mm[0] = o[0]; mm[1] = o[1]; mm[2] = o[2];
+            NodeRotate(r, Fn, i, &r.R0[i][3], o); mm[4] = o[0]; mm[5] = o[1]; mm[6] = o[2];
+            NodeRotate(r, Fn, i, &r.R0[i][6], o); mm[8] = o[0]; mm[9] = o[1]; mm[10] = o[2];
+            mm[12] = r.p[i][0]; mm[13] = r.p[i][1]; mm[14] = r.p[i][2];
+        }
+        else                                                   // sigue rigidamente a su ancla
+        {
+            int a = kAnchor[i];
+            float rel[3] = { r.p0[i][0]-r.p0[a][0], r.p0[i][1]-r.p0[a][1], r.p0[i][2]-r.p0[a][2] };
+            NodeRotate(r, Fn, a, rel, o);
+            mm[12] = r.p[a][0] + o[0]; mm[13] = r.p[a][1] + o[1]; mm[14] = r.p[a][2] + o[2];
+            NodeRotate(r, Fn, a, &r.R0[i][0], o); mm[0] = o[0]; mm[1] = o[1]; mm[2] = o[2];
+            NodeRotate(r, Fn, a, &r.R0[i][3], o); mm[4] = o[0]; mm[5] = o[1]; mm[6] = o[2];
+            NodeRotate(r, Fn, a, &r.R0[i][6], o); mm[8] = o[0]; mm[9] = o[1]; mm[10] = o[2];
+        }
     }
 }
 
@@ -459,13 +602,15 @@ static void RagdollOnHierarchy(void* hier)
             r.lastCheck = now;
             if(GetPedHierarchy(r.ped) != r.hier) { FLog("[ragdoll] fin (ped liberado) slot=%d", i); r.used = false; continue; }
         }
+        float* m = *(float**)((unsigned int*)hier + 2);          // pose animada del juego = objetivo del inicio
+        if(ValidPtr(m)) for(unsigned k = 0; k < r.n; ++k) { r.T[k][0] = m[k*16+12]; r.T[k][1] = m[k*16+13]; r.T[k][2] = m[k*16+14]; }
         if(now != r.lastTime && now - r.lastTime < 200)
         {
             float dt = (now - r.lastTime) * 0.001f;
             if(dt > 0.04f) dt = 0.04f;
-            RagdollStep(r, dt);
+            RagdollStep(r, dt, now);
             static int sl = 0;
-            if(sl++ < 8) FLog("[ragdoll] paso dt=%.3f pelvis=(%.2f,%.2f,%.2f) suelo=%.2f", dt, r.p[0][0], r.p[0][1], r.p[0][2], r.gz[0]);
+            if(sl++ < 12) FLog("[ragdoll] paso dt=%.3f pelvis=(%.2f,%.2f,%.2f) pie=%.2f suelo=%.2f", dt, r.p[1][0], r.p[1][1], r.p[1][2], r.p[26][2], r.gz[1]);
         }
         r.lastTime = now;
         RagdollWrite(r);
@@ -677,6 +822,8 @@ ON_MOD_LOAD()
     cfgRdImpulse = cfg->GetFloat("RagdollForce", 0.30f, "Settings");
     cfgRdRadius  = cfg->GetFloat("RagdollRadius",  0.10f, "Settings");
     cfgRdDamp    = cfg->GetFloat("RagdollDamping", 0.992f, "Settings");
+    cfgRdBlendTime = cfg->GetFloat("RagdollBlendTime", 0.45f, "Settings");
+    cfgRdBlend     = cfg->GetFloat("RagdollBlend", 0.55f, "Settings");
     cfg->Save();
 
     SETSYM_TO(ApplyMoveForce, hGTASA, "_ZN9CPhysical14ApplyMoveForceE7CVector");
