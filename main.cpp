@@ -52,11 +52,15 @@ static bool  cfgPlayer  = false;   // tambien tambalear al jugador
 static bool  cfgLog     = true;
 static bool  cfgRagdoll = true;     // ragdoll (Verlet) al morir
 static float cfgRdGravity = 14.0f;  // m/s^2
-static float cfgRdImpulse = 0.30f;  // m/s por punto de fuerza
+static float cfgRdImpulse = 0.10f;  // empuje inicial por punto de fuerza
 static float cfgRdRadius  = 0.10f;  // radio de cada articulacion contra el suelo
 static float cfgRdDamp    = 0.992f; // amortiguacion por paso
-static float cfgRdBlendTime = 0.45f; // segundos que sigue la animacion del juego al empezar
-static float cfgRdBlend     = 0.55f; // fuerza de esa mezcla (0 = ragdoll puro)
+static float cfgRdBlendTime = 0.0f;  // segundos que sigue la animacion del juego (0 = ragdoll instantaneo)
+static float cfgRdBlend     = 0.0f;  // fuerza de esa mezcla (0 = ragdoll puro)
+static int   cfgRdIter      = 10;    // iteraciones del solver (mas = mas rigido, mas costo)
+static float cfgRdStiff     = 1.0f;  // rigidez de las articulaciones (0..1)
+static float cfgRdJointDamp = 0.12f; // amortiguacion de velocidad relativa entre huesos conectados
+static float cfgRdSelfColl  = 1.0f;  // 0 = sin colision entre partes del cuerpo
 static bool  cfgBoneTest = false;   // prueba visible: el ped "flota" 2.5 s tras un golpe
 
 // ---------------------------------------------------------------- log a archivo
@@ -290,8 +294,8 @@ static const CDef kC[] = {
     {15,16,0.99f,1.01f}, {16,17,0.99f,1.01f}, {17,18,0.99f,1.01f},
     {24,25,0.99f,1.01f}, {25,26,0.99f,1.01f}, {26,27,0.99f,1.01f},                      // pierna
     {28,29,0.99f,1.01f}, {29,30,0.99f,1.01f}, {30,31,0.99f,1.01f},
-    {10,12,0.38f,1.00f}, {16,18,0.38f,1.00f},                                           // flexion del codo
-    {24,26,0.50f,1.00f}, {28,30,0.50f,1.00f},                                           // flexion de la rodilla
+    {10,12,0.42f,1.00f}, {16,18,0.42f,1.00f},                                           // flexion del codo
+    {24,26,0.55f,1.00f}, {28,30,0.55f,1.00f},                                           // flexion de la rodilla
     {25,27,0.72f,1.00f}, {29,31,0.72f,1.00f},                                           // tobillo
     {1,25,0.79f,1.19f}, {1,29,0.79f,1.19f}                                              // cadera: las piernas no se cruzan por debajo del cuerpo
 };
@@ -398,7 +402,7 @@ static void RagdollInit(Ragdoll& r)
     {
         int a = kTorso[x], b = kTorso[y];
         float d[3] = { r.p0[b][0]-r.p0[a][0], r.p0[b][1]-r.p0[a][1], r.p0[b][2]-r.p0[a][2] };
-        r.ca[r.nc] = a; r.cb[r.nc] = b; r.cmn[r.nc] = 0.96f; r.cmx[r.nc] = 1.04f; r.cd0[r.nc] = sqrtf(Dot3(d,d)); ++r.nc;
+        r.ca[r.nc] = a; r.cb[r.nc] = b; r.cmn[r.nc] = 0.98f; r.cmx[r.nc] = 1.02f; r.cd0[r.nc] = sqrtf(Dot3(d,d)); ++r.nc;
     }
     for(unsigned k = 0; k < sizeof(kC)/sizeof(kC[0]) && r.nc < RD_MAXC; ++k)
     {
@@ -416,7 +420,7 @@ static void RagdollInit(Ragdoll& r)
     // velocidad inicial: empuje del impacto, mas fuerte arriba para que el torso se incline
     float pelvisZ = r.p0[1][2];
     float speed = r.force * cfgRdImpulse * 0.02f;
-    if(speed > 0.12f) speed = 0.12f;
+    if(speed > 0.04f) speed = 0.04f;
     for(unsigned i = 0; i < n; ++i)
     {
         if(!IsActive((int)i)) continue;
@@ -435,9 +439,69 @@ static void SolvePair(Ragdoll& r, int a, int b, float mn, float mx, float d0)
     float l = sqrtf(Dot3(d,d)); if(l < 1e-6f) return;
     float tgt;
     if(l < mn*d0) tgt = mn*d0; else if(l > mx*d0) tgt = mx*d0; else return;
-    float diff = (l - tgt) / l;
+    float diff = (l - tgt) / l * cfgRdStiff;
     float wa = r.im[a], wb = r.im[b], s = wa + wb;
     for(int k = 0; k < 3; ++k) { r.p[a][k] += d[k]*diff*wa/s; r.p[b][k] -= d[k]*diff*wb/s; }
+}
+
+
+// ---- capsulas de los huesos largos: evitan que un miembro atraviese el cuerpo u otro miembro ----
+struct SegDef { unsigned char a, b; float r; };
+static const SegDef kSeg[] = {
+    {10,11,0.06f},{11,12,0.05f},{16,17,0.06f},{17,18,0.05f},          // brazos
+    {24,25,0.08f},{25,26,0.06f},{26,27,0.04f},{28,29,0.08f},{29,30,0.06f},{30,31,0.04f},   // piernas
+    {1,3,0.13f},{3,4,0.12f},{4,5,0.09f}                              // torso, cuello
+};
+#define NSEG ((int)(sizeof(kSeg)/sizeof(kSeg[0])))
+static bool SegAdj(const SegDef& s, const SegDef& t)
+{
+    int xs[2] = { s.a, s.b }, ys[2] = { t.a, t.b };
+    for(int i = 0; i < 2; ++i) for(int j = 0; j < 2; ++j)
+    {
+        int x = xs[i], y = ys[j];
+        if(x == y || kParent[x] == y || kParent[y] == x) return true;
+    }
+    return false;
+}
+static inline float Clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
+static void ClosestSegSeg(const float* p1, const float* q1, const float* p2, const float* q2, float& s, float& t)
+{
+    float d1[3] = { q1[0]-p1[0], q1[1]-p1[1], q1[2]-p1[2] };
+    float d2[3] = { q2[0]-p2[0], q2[1]-p2[1], q2[2]-p2[2] };
+    float r[3]  = { p1[0]-p2[0], p1[1]-p2[1], p1[2]-p2[2] };
+    float a = Dot3(d1,d1), e = Dot3(d2,d2), f = Dot3(d2,r);
+    const float EPS = 1e-8f;
+    if(a <= EPS && e <= EPS) { s = t = 0.f; return; }
+    if(a <= EPS) { s = 0.f; t = Clamp01(f / e); return; }
+    float c = Dot3(d1,r);
+    if(e <= EPS) { t = 0.f; s = Clamp01(-c / a); return; }
+    float b = Dot3(d1,d2), denom = a*e - b*b;
+    s = (denom > EPS) ? Clamp01((b*f - c*e) / denom) : 0.f;
+    t = (b*s + f) / e;
+    if(t < 0.f)      { t = 0.f; s = Clamp01(-c / a); }
+    else if(t > 1.f) { t = 1.f; s = Clamp01((b - c) / a); }
+}
+static void SolveSegSeg(Ragdoll& r, const SegDef& A, const SegDef& B)
+{
+    float* pa = r.p[A.a]; float* pb = r.p[A.b]; float* pc = r.p[B.a]; float* pd = r.p[B.b];
+    float s, t; ClosestSegSeg(pa, pb, pc, pd, s, t);
+    float c1[3], c2[3];
+    for(int k = 0; k < 3; ++k) { c1[k] = pa[k] + (pb[k]-pa[k])*s; c2[k] = pc[k] + (pd[k]-pc[k])*t; }
+    float n[3] = { c1[0]-c2[0], c1[1]-c2[1], c1[2]-c2[2] };
+    float dist = sqrtf(Dot3(n,n));
+    float req = (A.r + B.r) * 0.88f;
+    if(dist >= req) return;
+    if(dist < 1e-5f) { n[0] = 0.f; n[1] = 0.f; n[2] = 1.f; dist = 0.f; }
+    else { n[0] /= dist; n[1] /= dist; n[2] /= dist; }
+    float ia = r.im[A.a], ib = r.im[A.b], ic = r.im[B.a], id = r.im[B.b];
+    float den = (1-s)*(1-s)*ia + s*s*ib + (1-t)*(1-t)*ic + t*t*id;
+    if(den < 1e-6f) return;
+    float lam = (req - dist) / den * 0.9f;
+    for(int k = 0; k < 3; ++k)
+    {
+        pa[k] += n[k]*lam*(1-s)*ia; pb[k] += n[k]*lam*s*ib;
+        pc[k] -= n[k]*lam*(1-t)*ic; pd[k] -= n[k]*lam*t*id;
+    }
 }
 
 static void RagdollStep(Ragdoll& r, float dt, unsigned int now)
@@ -460,6 +524,20 @@ static void RagdollStep(Ragdoll& r, float dt, unsigned int now)
         if(w > 0.f)                                   // al principio sigue la animacion del juego (intenta mantenerse)
             for(int k = 0; k < 3; ++k) r.p[i][k] += (r.T[i][k] - r.p[i][k]) * 0.35f * w;
     }
+    // amortiguacion articular: frena la velocidad relativa entre huesos conectados (evita el efecto gelatina)
+    if(cfgRdJointDamp > 0.f)
+        for(int c = 0; c < r.nc; ++c)
+        {
+            if(r.cmn[c] < 0.97f) continue;                       // solo segmentos rigidos
+            int a = r.ca[c], b = r.cb[c];
+            for(int k = 0; k < 3; ++k)
+            {
+                float va = r.p[a][k] - r.pv[a][k], vb = r.p[b][k] - r.pv[b][k];
+                float rel = (vb - va) * cfgRdJointDamp * 0.5f;
+                r.pv[a][k] = r.p[a][k] - (va + rel);
+                r.pv[b][k] = r.p[b][k] - (vb - rel);
+            }
+        }
     if(FindGroundZFor3DCoord)
         for(unsigned i = 0; i < r.n; ++i)
         {
@@ -468,7 +546,7 @@ static void RagdollStep(Ragdoll& r, float dt, unsigned int now)
             float z = FindGroundZFor3DCoord(r.p[i][0], r.p[i][1], r.p[i][2] + 0.6f, &found, &ent);
             if(found) r.gz[i] = z;
         }
-    for(int it = 0; it < 8; ++it)
+    for(int it = 0; it < cfgRdIter; ++it)
     {
         for(int c = 0; c < r.nc; ++c) SolvePair(r, r.ca[c], r.cb[c], r.cmn[c], r.cmx[c], r.cd0[c]);
 
@@ -491,8 +569,17 @@ static void RagdollStep(Ragdoll& r, float dt, unsigned int now)
             if(offE > 0.f) for(int k = 0; k < 3; ++k) { float c = offE * F[k]; r.p[E][k] -= c*0.5f; r.p[S][k] += c*0.25f; r.p[Hd][k] += c*0.25f; }
         }
 
+        // capsulas: huesos largos contra el resto del cuerpo (brazo/pierna no atraviesan torso ni entre si)
+        if(cfgRdSelfColl > 0.f)
+            for(int a = 0; a < NSEG; ++a)
+                for(int b = a + 1; b < NSEG; ++b)
+                {
+                    if(SegAdj(kSeg[a], kSeg[b])) continue;
+                    SolveSegSeg(r, kSeg[a], kSeg[b]);
+                }
+
         // volumen: las partes del cuerpo no se atraviesan entre si
-        for(int i = 1; i < 32; ++i)
+        for(int i = 1; i < 32 && cfgRdSelfColl > 0.f; ++i)
         {
             if(!IsActive(i)) continue;
             for(int j = i + 1; j < 32; ++j)
@@ -819,11 +906,17 @@ ON_MOD_LOAD()
     cfgBoneTest = cfg->GetBool("BoneTest",    false, "Settings");
     cfgRagdoll  = cfg->GetBool ("Ragdoll",    true,  "Settings");
     cfgRdGravity = cfg->GetFloat("RagdollGravity", 14.0f, "Settings");
-    cfgRdImpulse = cfg->GetFloat("RagdollForce", 0.30f, "Settings");
+    cfgRdImpulse = cfg->GetFloat("RagdollPush", 0.10f, "Settings");
     cfgRdRadius  = cfg->GetFloat("RagdollRadius",  0.10f, "Settings");
     cfgRdDamp    = cfg->GetFloat("RagdollDamping", 0.992f, "Settings");
-    cfgRdBlendTime = cfg->GetFloat("RagdollBlendTime", 0.45f, "Settings");
-    cfgRdBlend     = cfg->GetFloat("RagdollBlend", 0.55f, "Settings");
+    cfgRdBlendTime = cfg->GetFloat("RagdollBlendTime2", 0.0f, "Settings");
+    cfgRdBlend     = cfg->GetFloat("RagdollBlend2", 0.0f, "Settings");
+    cfgRdIter      = (int)cfg->GetFloat("RagdollIterations", 10.0f, "Settings");
+    cfgRdStiff     = cfg->GetFloat("RagdollStiffness", 1.0f, "Settings");
+    cfgRdJointDamp = cfg->GetFloat("RagdollJointDamping", 0.12f, "Settings");
+    cfgRdSelfColl  = cfg->GetFloat("RagdollSelfCollision", 1.0f, "Settings");
+    if(cfgRdIter < 2) cfgRdIter = 2; if(cfgRdIter > 24) cfgRdIter = 24;
+    if(cfgRdStiff < 0.05f) cfgRdStiff = 0.05f; if(cfgRdStiff > 1.0f) cfgRdStiff = 1.0f;
     cfg->Save();
 
     SETSYM_TO(ApplyMoveForce, hGTASA, "_ZN9CPhysical14ApplyMoveForceE7CVector");
