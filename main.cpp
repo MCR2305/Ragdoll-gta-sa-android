@@ -38,6 +38,9 @@ static GetAnimHierarchyFromFrame_t GetAnimHierarchyFromFrame = NULL;
 static GetBonePosition_t           GetBonePosition           = NULL;
 typedef float (*FindGroundZ3D_t)(float x, float y, float z, bool* found, void** ent);
 static FindGroundZ3D_t             FindGroundZFor3DCoord     = NULL;
+typedef void (*FindObjectsInRange_t)(const void* center, float radius, bool b2D, short* n, short maxN, void** list, bool bld, bool veh, bool ped, bool obj, bool dum);
+static FindObjectsInRange_t        FindObjectsInRange        = NULL;
+static void**                      pModelInfoPtrs            = NULL;
 
 static uintptr_t pGTASA = 0;
 static void*     hGTASA = NULL;
@@ -50,7 +53,7 @@ static float cfgDecay   = 0.90f;   // cuanto baja el empuje cada frame
 static float cfgWeaponM = 1.0f;    // multiplicador armas
 static float cfgCarM    = 1.0f;    // multiplicador autos
 static float cfgExplM   = 1.0f;    // multiplicador explosiones
-static bool  cfgPlayer  = false;   // tambien tambalear al jugador
+static bool  cfgPlayer  = true;    // el ragdoll tambien se aplica a CJ
 static bool  cfgLog     = true;
 static bool  cfgRagdoll = true;     // ragdoll (Verlet) al morir
 static float cfgRdGravity = 14.0f;  // m/s^2
@@ -68,7 +71,15 @@ static int   cfgMaxExpTicks  = 2;      // maximo de explosiones procesadas por N
 static float cfgRdMaxStep    = 0.10f;  // tope de desplazamiento por paso de cada articulacion (m)
 static bool  cfgLenLock      = true;   // bloqueo estricto de longitud de huesos
 static int   cfgLegPasses    = 4;      // pasadas extra de rigidez en piernas/caderas
-static float cfgLegDamp      = 0.25f;  // amortiguacion extra de rodillas/caderas
+static float cfgLegDamp      = 0.35f;  // amortiguacion extra de rodillas/caderas
+static float cfgKneeSpring   = 0.004f; // resistencia de la rodilla: tiende a una flexion natural
+static bool  cfgRunOver      = true;   // atropello: ragdoll aunque el NPC no muera
+static float cfgRunOverMin   = 2.5f;   // velocidad minima del vehiculo (m/s) para activar el ragdoll
+static float cfgRunOverXfer  = 0.60f;  // fraccion de la velocidad del vehiculo que se transfiere al cuerpo
+static float cfgAliveTime    = 3.5f;   // segundos que dura el ragdoll de un NPC vivo
+static float cfgReleaseTime  = 0.35f;  // segundos de mezcla al devolver el control a la animacion
+static bool  cfgSyncEntity   = true;   // el NPC vivo sigue a su cuerpo ragdoll
+static bool  cfgVehCollision = true;   // el cuerpo ragdoll choca con vehiculos
 static bool  cfgSafeReads    = true;
 static float cfgRdBodyScale  = 1.0f;   // escala del volumen del cuerpo (radios)
 static float cfgSpineStiff   = 0.9f;   // 0..1: cuanto se mantiene recta la columna   // comprobar con mincore() que un puntero es legible antes de leerlo
@@ -335,7 +346,7 @@ static const CDef kC[] = {
     {24,25,0.99f,1.01f}, {25,26,0.99f,1.01f},                                           // pierna derecha
     {28,29,0.99f,1.01f}, {29,30,0.99f,1.01f},                                           // pierna izquierda
     {10,12,0.50f,1.00f}, {16,18,0.50f,1.00f},                                           // flexion del codo (max ~115 grados)
-    {24,26,0.62f,1.00f}, {28,30,0.62f,1.00f},                                           // flexion de la rodilla (max ~100 grados)
+    {24,26,0.74f,1.00f}, {28,30,0.74f,1.00f},                                           // flexion de la rodilla (max ~85 grados)
     {1,25,0.82f,1.15f},  {1,29,0.82f,1.15f},                                            // cadera: la pierna no se cruza bajo el cuerpo
     {25,29,0.62f,4.00f}, {26,30,0.62f,4.00f}                                            // separacion minima entre rodillas y entre tobillos
 };
@@ -381,6 +392,187 @@ static float NodeDamp(int i)
     return base - extra;
 }
 
+// ======================= VEHICULOS: seguimiento y cajas de colision =======================
+// Cada tick se consultan los vehiculos cercanos al jugador con CWorld::FindObjectsInRange (solo devuelve
+// entidades vivas) y se guarda una COPIA de su estado: nunca se vuelve a leer un puntero de vehiculo despues.
+struct VehTrack
+{
+    bool  used, bbox; int bboxTry;
+    void* v; unsigned int seen, tPrev;
+    float pos[3], prev[3], vel[3];          // posicion y velocidad (m/s) por diferencias entre frames
+    float ax[3], ay[3], az[3];              // ejes: derecha, adelante, arriba
+    float bmn[3], bmx[3];                   // caja local del modelo
+};
+#define NVEH 32
+static VehTrack g_veh[NVEH];
+static unsigned int g_vehTick = 0xFFFFFFFFu;
+static int g_miOff = -1, g_colOff = -1;
+static int g_vehLogs = 0;
+
+static bool PlausibleBox(const float* b)
+{   // {min.x,min.y,min.z,max.x,max.y,max.z}: dimensiones de un vehiculo
+    for(int i = 0; i < 6; ++i) if(!FiniteF(b[i])) return false;
+    return b[0] < -0.2f && b[3] > 0.2f && b[1] < -0.5f && b[4] > 0.5f && b[5] > b[2] + 0.5f
+        && b[0] > -4.5f && b[3] < 4.5f && b[1] > -14.f && b[4] < 14.f && b[2] > -3.5f && b[5] < 6.f;
+}
+// La caja se busca en la col. del modelo; los desplazamientos de este juego se calibran solos en la primera lectura valida
+static bool ReadVehBox(void* veh, float* mn, float* mx)
+{
+    if(!pModelInfoPtrs) return false;
+    static const int entOffs[] = { 0x22, 0x26, 0x24, 0x20, 0x28, 0x2A };
+    for(unsigned a = 0; a < sizeof(entOffs)/sizeof(entOffs[0]); ++a)
+    {
+        int eo = entOffs[a];
+        if(g_miOff >= 0 && eo != g_miOff) continue;
+        unsigned short mi = *(unsigned short*)((char*)veh + eo);
+        if(mi == 0 || mi >= 20000) continue;
+        void* info = pModelInfoPtrs[mi];
+        if(!ValidPtr(info) || (((uintptr_t)info) & 3) || !CanRead(info, 0x60)) continue;
+        for(int co = 0x08; co <= 0x40; co += 4)
+        {
+            if(g_colOff >= 0 && co != g_colOff) continue;
+            void* col = *(void**)((char*)info + co);
+            if(!ValidPtr(col) || (((uintptr_t)col) & 3) || !CanRead(col, 0x20)) continue;
+            const float* b = (const float*)col;
+            if(!PlausibleBox(b)) continue;
+            if(g_miOff < 0) { g_miOff = eo; g_colOff = co; FLog("[veh] calibrado: modelo en +0x%X, colision en +0x%X, caja (%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f)", eo, co, b[0], b[1], b[2], b[3], b[4], b[5]); }
+            for(int k = 0; k < 3; ++k) { mn[k] = b[k]; mx[k] = b[3+k]; }
+            return true;
+        }
+    }
+    return false;
+}
+
+static VehTrack* FindTrack(void* v)
+{
+    for(int i = 0; i < NVEH; ++i) if(g_veh[i].used && g_veh[i].v == v) return &g_veh[i];
+    return NULL;
+}
+
+static void UpdateVehicles(unsigned int now)
+{
+    if(now == g_vehTick) return;
+    g_vehTick = now;
+    if(!FindObjectsInRange || !FindPlayerPed) return;
+    void* pl = FindPlayerPed(0);
+    CVector c;
+    if(!GetPos(pl, c)) return;
+    short n = 0; void* list[48];
+    FindObjectsInRange(&c, 45.0f, false, &n, 48, list, false, true, false, false, false);
+    if(n <= 0 || n > 48) return;
+    for(int i = 0; i < n; ++i)
+    {
+        void* e = list[i];
+        if(!ValidPtr(e) || (((uintptr_t)e) & 3) || !CanRead(e, 0x60)) continue;
+        void* m = *(void**)((char*)e + 0x14);
+        if(!ValidPtr(m) || (((uintptr_t)m) & 3) || !CanRead(m, 0x40)) continue;
+        const float* f = (const float*)m;
+        if(!InWorld(f[12], f[13], f[14])) continue;
+        VehTrack* t = FindTrack(e);
+        if(!t)
+        {
+            int slot = -1; unsigned int oldest = 0xFFFFFFFFu;
+            for(int k = 0; k < NVEH; ++k)
+            {
+                if(!g_veh[k].used || now - g_veh[k].seen > 2000) { slot = k; break; }
+                if(g_veh[k].seen < oldest) { oldest = g_veh[k].seen; slot = k; }
+            }
+            t = &g_veh[slot];
+            memset(t, 0, sizeof(*t));
+            t->used = true; t->v = e; t->tPrev = now;
+            t->prev[0] = f[12]; t->prev[1] = f[13]; t->prev[2] = f[14];
+        }
+        float dt = (now - t->tPrev) * 0.001f;
+        if(now != t->tPrev)
+        {
+            if(dt > 0.004f && dt < 0.25f)
+            {
+                for(int k = 0; k < 3; ++k)
+                {
+                    float nv = (f[12+k] - t->prev[k]) / dt;
+                    if(!FiniteF(nv) || fabsf(nv) > 120.f) nv = 0.f;
+                    t->vel[k] = t->vel[k] * 0.5f + nv * 0.5f;
+                }
+            }
+            else if(dt >= 0.25f) { t->vel[0] = t->vel[1] = t->vel[2] = 0.f; }
+            t->prev[0] = f[12]; t->prev[1] = f[13]; t->prev[2] = f[14]; t->tPrev = now;
+        }
+        for(int k = 0; k < 3; ++k) { t->pos[k] = f[12+k]; t->ax[k] = f[k]; t->ay[k] = f[4+k]; t->az[k] = f[8+k]; }
+        t->seen = now;
+        if(!t->bbox && t->bboxTry < 6)
+        {
+            ++t->bboxTry;
+            float mn[3], mx[3];
+            if(ReadVehBox(e, mn, mx)) { for(int k = 0; k < 3; ++k) { t->bmn[k] = mn[k]; t->bmx[k] = mx[k]; } t->bbox = true; }
+            else if(t->bboxTry >= 6)    // caja por defecto de un coche
+            {
+                t->bmn[0] = -0.95f; t->bmn[1] = -2.25f; t->bmn[2] = -0.70f; t->bmx[0] = 0.95f; t->bmx[1] = 2.25f; t->bmx[2] = 0.90f; t->bbox = true;
+                if(g_vehLogs++ < 5) FLog("[veh] sin caja de colision para el vehiculo %p, se usa una caja por defecto", e);
+            }
+        }
+    }
+}
+
+struct VBox { float c[3], ax[3], ay[3], az[3], h[3], vs[3]; void* id; };
+static void BuildBox(const VehTrack& t, float dt, const float* mn, const float* mx, VBox& b)
+{
+    for(int k = 0; k < 3; ++k)
+    {
+        b.h[k] = (mx[k] - mn[k]) * 0.5f;
+        b.ax[k] = t.ax[k]; b.ay[k] = t.ay[k]; b.az[k] = t.az[k];
+        b.vs[k] = t.vel[k] * dt;
+    }
+    float cl[3] = { (mx[0]+mn[0])*0.5f, (mx[1]+mn[1])*0.5f, (mx[2]+mn[2])*0.5f };
+    for(int k = 0; k < 3; ++k) b.c[k] = t.pos[k] + t.ax[k]*cl[0] + t.ay[k]*cl[1] + t.az[k]*cl[2];
+    b.id = t.v;
+}
+// Caja completa del vehiculo (para comprobar si algo esta dentro / se acerca)
+static bool MakeVBox(const VehTrack& t, float dt, VBox& b)
+{
+    if(!t.bbox) return false;
+    BuildBox(t, dt, t.bmn, t.bmx, b);
+    return true;
+}
+// Forma para colisionar: base (paragolpes y bajos) + cabina/capo mas corta. Asi las piernas chocan con el paragolpes y el
+// torso puede caer sobre el capo. Los vehiculos largos o bajos (camiones, motos) usan una sola caja.
+static int MakeVShape(const VehTrack& t, float dt, VBox* out)
+{
+    if(!t.bbox) return 0;
+    float len = t.bmx[1] - t.bmn[1], hgt = t.bmx[2] - t.bmn[2];
+    if(len < 3.2f || len > 6.2f || hgt < 1.1f)
+    {
+        BuildBox(t, dt, t.bmn, t.bmx, out[0]);
+        return 1;
+    }
+    float zs = t.bmn[2] + hgt * 0.55f;                   // altura del capo
+    float lo_mn[3] = { t.bmn[0], t.bmn[1], t.bmn[2] }, lo_mx[3] = { t.bmx[0], t.bmx[1], zs };
+    float up_mn[3] = { t.bmn[0], t.bmn[1] + len * 0.30f, zs }, up_mx[3] = { t.bmx[0], t.bmx[1] - len * 0.12f, t.bmx[2] };
+    BuildBox(t, dt, lo_mn, lo_mx, out[0]);
+    BuildBox(t, dt, up_mn, up_mx, out[1]);
+    return 2;
+}
+// La articulacion no puede entrar en la caja del vehiculo: sale por la cara mas cercana y adopta su velocidad
+// (el vehiculo "empuja", y el cuerpo puede quedar apoyado sobre el capo o el techo)
+static bool CollideParticleBox(float* p, float* pv, float rad, const VBox& b)
+{
+    float d[3] = { p[0]-b.c[0], p[1]-b.c[1], p[2]-b.c[2] };
+    float lx = Dot3(d, b.ax), ly = Dot3(d, b.ay), lz = Dot3(d, b.az);
+    float ex = b.h[0] + rad - fabsf(lx), ey = b.h[1] + rad - fabsf(ly), ez = b.h[2] + rad - fabsf(lz);
+    if(ex <= 0.f || ey <= 0.f || ez <= 0.f) return false;
+    const float* ax; float pen, sg;
+    if(ex <= ey && ex <= ez) { ax = b.ax; pen = ex; sg = lx >= 0.f ? 1.f : -1.f; }
+    else if(ey <= ez)        { ax = b.ay; pen = ey; sg = ly >= 0.f ? 1.f : -1.f; }
+    else                     { ax = b.az; pen = ez; sg = lz >= 0.f ? 1.f : -1.f; }
+    float n[3] = { ax[0]*sg, ax[1]*sg, ax[2]*sg };
+    float vrel[3] = { p[0]-pv[0]-b.vs[0], p[1]-pv[1]-b.vs[1], p[2]-pv[2]-b.vs[2] };   // velocidad antes de corregir, relativa al vehiculo
+    for(int k = 0; k < 3; ++k) p[k] += n[k] * pen;
+    float vn = Dot3(vrel, n);
+    float vt[3] = { vrel[0]-n[0]*vn, vrel[1]-n[1]*vn, vrel[2]-n[2]*vn };
+    float keep = vn > 0.f ? vn : 0.f;                         // sin rebote: no sigue entrando
+    for(int k = 0; k < 3; ++k) pv[k] = p[k] - (n[k]*keep + vt[k]*0.80f + b.vs[k]);   // 20% de friccion: el vehiculo lo arrastra
+    return true;
+}
+
 struct Ragdoll
 {
     bool  used, inited;
@@ -402,11 +594,16 @@ struct Ragdoll
     void* clump; void* frame;    // cadena ped->clump->frame guardada al empezar (validacion sin llamar al juego)
     float dk[RD_MAXN];           // amortiguacion de cada particula
     int   dbg;                   // pasos registrados en el log
+    bool  alive, releasing, hasVel; unsigned int aliveUntil, relStart, sleepT;
+    float vel0[3];               // velocidad inicial (m/s) transferida por un atropello
+    float maxStep;               // tope de desplazamiento por paso de este ragdoll
+    float entOff[3]; bool entOk; // desplazamiento entre la entidad del ped y su pelvis
+    void* ignoreV[4]; int nIgn;  // vehiculos que se ignoran (el del propio ocupante)
 };
 static Ragdoll g_rd[RD_SLOTS];
 
 // Devuelve: 1 = iniciado/ya activo, 0 = reintentar en el siguiente frame, -1 = no se puede (se descarta)
-static int StartRagdoll(void* ped, float dx, float dy, float force)
+static int StartRagdollEx(void* ped, float dx, float dy, float force, bool alive, const float* vel)
 {
     void *clump = NULL, *frame = NULL;
     void* h = GetPedHierarchyEx(ped, &clump, &frame);
@@ -423,9 +620,17 @@ static int StartRagdoll(void* ped, float dx, float dy, float force)
     memset(&r, 0, sizeof(r));
     r.used = true; r.ped = ped; r.hier = h; r.clump = clump; r.frame = frame;
     r.dirx = dx; r.diry = dy; r.force = force;
-    FLog("[ragdoll] solicitado ped=%p hier=%p dir=(%.2f,%.2f) force=%.1f slot=%d", ped, h, dx, dy, force, slot);
+    r.maxStep = cfgRdMaxStep;
+    r.alive = alive; if(alive) r.aliveUntil = now + (unsigned int)(cfgAliveTime * 1000.f);
+    if(vel)
+    {
+        r.hasVel = true; r.vel0[0] = vel[0]; r.vel0[1] = vel[1]; r.vel0[2] = vel[2];
+        if(r.maxStep < 0.20f) r.maxStep = 0.20f;               // un atropello puede lanzar mas rapido que un disparo
+    }
+    FLog("[ragdoll] solicitado ped=%p hier=%p dir=(%.2f,%.2f) force=%.1f slot=%d vivo=%d vel=%d", ped, h, dx, dy, force, slot, alive ? 1 : 0, vel ? 1 : 0);
     return 1;
 }
+static int StartRagdoll(void* ped, float dx, float dy, float force) { return StartRagdollEx(ped, dx, dy, force, false, NULL); }
 
 // marco del torso a partir de pelvis(1), cuello(4) y caderas(24,28)
 static void TorsoFrame(const float P[][3], float* F)
@@ -526,14 +731,46 @@ static void RagdollInit(Ragdoll& r)
     Norm3(r.fwd0);
     // velocidad inicial: empuje del impacto, mas fuerte arriba para que el torso se incline
     float pelvisZ = r.p0[1][2];
-    float speed = r.force * cfgRdImpulse * 0.02f;
-    if(speed > 0.04f) speed = 0.04f;
-    for(unsigned i = 0; i < n; ++i)
+    if(r.hasVel)                                      // atropello: el cuerpo recibe la velocidad del vehiculo
     {
-        if(!IsActive((int)i)) continue;
-        float k = (r.p0[i][2] > pelvisZ + 0.25f) ? 1.4f : 1.0f;
-        r.pv[i][0] -= r.dirx * speed * k;
-        r.pv[i][1] -= r.diry * speed * k;
+        for(unsigned i = 0; i < n; ++i)
+        {
+            if(!IsActive((int)i)) continue;
+            float k = (r.p0[i][2] > pelvisZ + 0.25f) ? 1.15f : 1.0f;
+            float d[3] = { r.vel0[0]*0.016f*k, r.vel0[1]*0.016f*k, r.vel0[2]*0.016f };
+            float dl = sqrtf(Dot3(d,d));
+            if(dl > r.maxStep) { float kk = r.maxStep / dl; d[0] *= kk; d[1] *= kk; d[2] *= kk; }
+            r.pv[i][0] -= d[0]; r.pv[i][1] -= d[1]; r.pv[i][2] -= d[2];
+        }
+    }
+    else
+    {
+        float speed = r.force * cfgRdImpulse * 0.02f;
+        if(speed > cfgMaxImpulse * 0.02f) speed = cfgMaxImpulse * 0.02f;
+        for(unsigned i = 0; i < n; ++i)
+        {
+            if(!IsActive((int)i)) continue;
+            float k = (r.p0[i][2] > pelvisZ + 0.25f) ? 1.4f : 1.0f;
+            r.pv[i][0] -= r.dirx * speed * k;
+            r.pv[i][1] -= r.diry * speed * k;
+        }
+    }
+    {   // posicion de la entidad respecto a la pelvis (para que el NPC vivo siga a su cuerpo)
+        CVector ep;
+        if(GetPos(r.ped, ep)) { r.entOff[0] = ep.x - r.p0[1][0]; r.entOff[1] = ep.y - r.p0[1][1]; r.entOff[2] = ep.z - r.p0[1][2]; r.entOk = true; }
+        // vehiculos que contienen la pelvis al empezar (el propio coche del ocupante): se ignoran para este ragdoll
+        unsigned int tn = pTimeMs ? *pTimeMs : 0;
+        UpdateVehicles(tn);
+        r.nIgn = 0;
+        for(int k = 0; k < NVEH && r.nIgn < 4; ++k)
+        {
+            VehTrack& t = g_veh[k];
+            if(!t.used || tn - t.seen > 300) continue;
+            VBox b; if(!MakeVBox(t, 0.016f, b)) continue;
+            float d[3] = { r.p0[1][0]-b.c[0], r.p0[1][1]-b.c[1], r.p0[1][2]-b.c[2] };
+            if(fabsf(Dot3(d,b.ax)) < b.h[0] + 0.30f && fabsf(Dot3(d,b.ay)) < b.h[1] + 0.30f && fabsf(Dot3(d,b.az)) < b.h[2] + 0.30f && !r.hasVel)
+            { r.ignoreV[r.nIgn++] = t.v; FLog("[ragdoll] vehiculo %p ignorado (el ped esta dentro)", t.v); }
+        }
     }
     memcpy(r.sp, r.p, sizeof(r.sp)); memcpy(r.spv, r.pv, sizeof(r.spv)); r.hasSnap = true; r.fails = 0;
     r.inited = true;
@@ -626,7 +863,8 @@ static void RagdollStep(Ragdoll& r, float dt, unsigned int now)
         for(int k = 0; k < 3; ++k) vel[k] = (r.p[i][k] - r.pv[i][k]) * r.dk[i];
         float vl = sqrtf(Dot3(vel, vel));                       // tope de velocidad (explosiones, impulsos enormes)
         if(!(vl == vl)) { vel[0] = vel[1] = vel[2] = 0.f; vl = 0.f; }
-        if(vl > cfgRdMaxStep) { float k2 = cfgRdMaxStep / vl; vel[0] *= k2; vel[1] *= k2; vel[2] *= k2; }
+        float mxs = r.maxStep > 0.f ? r.maxStep : cfgRdMaxStep;
+        if(vl > mxs) { float k2 = mxs / vl; vel[0] *= k2; vel[1] *= k2; vel[2] *= k2; }
         for(int k = 0; k < 3; ++k) { r.pv[i][k] = r.p[i][k]; r.p[i][k] += vel[k]; }
         r.p[i][2] -= g;
         if(w > 0.f)                                   // al principio sigue la animacion del juego (intenta mantenerse)
@@ -676,6 +914,20 @@ static void RagdollStep(Ragdoll& r, float dt, unsigned int now)
             float z = FindGroundZFor3DCoord(r.p[i][0], r.p[i][1], r.p[i][2] + 0.6f, &found, &ent);
             if(found && FiniteF(z)) r.gz[i] = z;
         }
+    VBox vb[8]; int nvb = 0;                                      // vehiculos cercanos como cajas (copias, sin leer punteros)
+    if(cfgVehCollision)
+    {
+        for(int k = 0; k < NVEH && nvb < 6; ++k)
+        {
+            VehTrack& t = g_veh[k];
+            if(!t.used || now - t.seen > 300) continue;
+            float d[3] = { t.pos[0]-r.p[1][0], t.pos[1]-r.p[1][1], t.pos[2]-r.p[1][2] };
+            if(Dot3(d,d) > 10.f*10.f) continue;
+            bool ign = false; for(int q = 0; q < r.nIgn; ++q) if(r.ignoreV[q] == t.v) ign = true;
+            if(ign) continue;
+            nvb += MakeVShape(t, dt, vb + nvb);
+        }
+    }
     for(int it = 0; it < cfgRdIter; ++it)
     {
         for(int c = 0; c < r.nc; ++c) SolvePair(r, r.ca[c], r.cb[c], r.cmn[c], r.cmx[c], r.cd0[c], cfgRdStiff);
@@ -704,6 +956,21 @@ static void RagdollStep(Ragdoll& r, float dt, unsigned int now)
             float dk[3] = { r.p[K][0]-mid[0], r.p[K][1]-mid[1], r.p[K][2]-mid[2] };
             float off = Dot3(dk, F);
             if(off < 0.f) for(int k = 0; k < 3; ++k) { float c = -off * F[k]; r.p[K][k] += c*0.5f; r.p[H][k] -= c*0.25f; r.p[A][k] -= c*0.25f; }
+            {   // bisagra: la rodilla casi no se desvia hacia los lados (eje lateral del torso)
+                float lat = Dot3(dk, Fn);                                  // Fn[0..2] = eje lateral
+                float lim = 0.06f;
+                if(fabsf(lat) > lim)
+                {
+                    float ex = lat - (lat > 0.f ? lim : -lim);
+                    for(int k = 0; k < 3; ++k) { r.p[K][k] -= Fn[k]*ex*0.6f; r.p[H][k] += Fn[k]*ex*0.2f; r.p[A][k] += Fn[k]*ex*0.2f; }
+                }
+                if(cfgKneeSpring > 0.f)                                    // resistencia: tiende a una flexion natural pequena hacia delante
+                {
+                    float full = sqrtf((r.p0[K][0]-r.p0[H][0])*(r.p0[K][0]-r.p0[H][0]) + (r.p0[K][1]-r.p0[H][1])*(r.p0[K][1]-r.p0[H][1]) + (r.p0[K][2]-r.p0[H][2])*(r.p0[K][2]-r.p0[H][2]))
+                               + sqrtf((r.p0[A][0]-r.p0[K][0])*(r.p0[A][0]-r.p0[K][0]) + (r.p0[A][1]-r.p0[K][1])*(r.p0[A][1]-r.p0[K][1]) + (r.p0[A][2]-r.p0[K][2])*(r.p0[A][2]-r.p0[K][2]));
+                    for(int k = 0; k < 3; ++k) { float tg = mid[k] + F[k] * 0.10f * full; r.p[K][k] += (tg - r.p[K][k]) * cfgKneeSpring; }
+                }
+            }
             int S = arms[s][0], E = arms[s][1], Hd = arms[s][2];
             float mid2[3] = { (r.p[S][0]+r.p[Hd][0])*0.5f, (r.p[S][1]+r.p[Hd][1])*0.5f, (r.p[S][2]+r.p[Hd][2])*0.5f };
             float de[3] = { r.p[E][0]-mid2[0], r.p[E][1]-mid2[1], r.p[E][2]-mid2[2] };
@@ -741,6 +1008,11 @@ static void RagdollStep(Ragdoll& r, float dt, unsigned int now)
             }
         }
 
+        // vehiculos: las articulaciones no entran en la caja del coche (el coche empuja; el cuerpo puede quedar encima)
+        for(int b = 0; b < nvb; ++b)
+            for(unsigned i = 0; i < r.n; ++i)
+                if(IsActive((int)i)) CollideParticleBox(r.p[i], r.pv[i], r.rad[i] * 0.85f, vb[b]);
+
         // suelo + friccion (cada articulacion con su radio)
         for(unsigned i = 0; i < r.n; ++i)
         {
@@ -766,6 +1038,9 @@ static void RagdollStep(Ragdoll& r, float dt, unsigned int now)
         for(int ps = 0; ps < 6; ++ps)
             for(int c = 0; c < r.nc; ++c)
                 if(r.cmn[c] >= 0.97f) SolvePair(r, r.ca[c], r.cb[c], r.cmn[c], r.cmx[c], r.cd0[c], 1.0f);
+        for(int b = 0; b < nvb; ++b)                                // los vehiculos tienen la ultima palabra: nada queda dentro de un coche
+            for(unsigned i = 0; i < r.n; ++i)
+                if(IsActive((int)i)) CollideParticleBox(r.p[i], r.pv[i], r.rad[i] * 0.85f, vb[b]);
         for(unsigned i = 0; i < r.n; ++i)                           // el suelo manda sobre todo
         {
             if(!IsActive((int)i)) continue;
@@ -815,7 +1090,7 @@ static void RagdollStep(Ragdoll& r, float dt, unsigned int now)
         }
         float tsec = (now - r.startTime) * 0.001f;
         if(tsec > 0.6f && na > 0 && sum / na < 0.006f && contact * 10 >= na * 6) ++r.calm; else r.calm = 0;
-        if(r.calm > 20) { r.asleep = true; memcpy(r.pv, r.p, sizeof(r.pv)); }
+        if(r.calm > 20) { r.asleep = true; r.sleepT = now; memcpy(r.pv, r.p, sizeof(r.pv)); }
     }
     else
     {
@@ -890,6 +1165,44 @@ static void RagdollWrite(Ragdoll& r)
     }
 }
 
+// un vehiculo en movimiento toca un cuerpo que estaba en reposo?  -> hay que despertarlo
+static bool VehicleWakes(Ragdoll& r, unsigned int now)
+{
+    if(!cfgVehCollision) return false;
+    for(int k = 0; k < NVEH; ++k)
+    {
+        VehTrack& t = g_veh[k];
+        if(!t.used || now - t.seen > 300) continue;
+        float sp2 = t.vel[0]*t.vel[0] + t.vel[1]*t.vel[1] + t.vel[2]*t.vel[2];
+        if(sp2 < 0.5f*0.5f) continue;
+        bool ign = false; for(int q = 0; q < r.nIgn; ++q) if(r.ignoreV[q] == t.v) ign = true;
+        if(ign) continue;
+        VBox b; if(!MakeVBox(t, 0.016f, b)) continue;
+        for(unsigned i = 0; i < r.n; ++i)
+        {
+            if(!IsActive((int)i)) continue;
+            float d[3] = { r.p[i][0]-b.c[0], r.p[i][1]-b.c[1], r.p[i][2]-b.c[2] };
+            float rr = r.rad[i] + 0.25f;
+            if(fabsf(Dot3(d,b.ax)) < b.h[0] + rr && fabsf(Dot3(d,b.ay)) < b.h[1] + rr && fabsf(Dot3(d,b.az)) < b.h[2] + rr) return true;
+        }
+    }
+    return false;
+}
+
+// el NPC vivo sigue a su cuerpo (solo horizontal; la altura la sigue decidiendo el juego)
+static void SyncEntity(Ragdoll& r)
+{
+    if(!r.entOk || !r.inited || !IsValidPed(r.ped)) return;
+    void* mtx = *(void**)((char*)r.ped + 0x14);
+    float* dst = NULL;
+    if(ValidPtr(mtx) && (((uintptr_t)mtx) & 3) == 0 && CanRead(mtx, 0x40)) dst = (float*)((char*)mtx + 0x30);
+    else if(CanRead(r.ped, 0x20)) dst = (float*)((char*)r.ped + 0x04);
+    if(!dst) return;
+    float nx = r.p[1][0] + r.entOff[0], ny = r.p[1][1] + r.entOff[1];
+    if(!InWorld(nx, ny, dst[2])) return;
+    dst[0] = nx; dst[1] = ny;
+}
+
 static void RagdollOnHierarchy(void* hier)
 {
     unsigned int now = *pTimeMs;
@@ -908,6 +1221,13 @@ static void RagdollOnHierarchy(void* hier)
         float* m = *(float**)((unsigned int*)hier + 2);          // pose animada del juego = objetivo del inicio
         if(!ValidPtr(m) || !CanRead(m, r.n * 64)) { r.used = false; continue; }
         for(unsigned k = 0; k < r.n; ++k) { r.T[k][0] = m[k*16+12]; r.T[k][1] = m[k*16+13]; r.T[k][2] = m[k*16+14]; }
+        if(r.asleep && VehicleWakes(r, now)) { r.asleep = false; r.calm = 0; }           // un vehiculo vuelve a empujar el cuerpo
+        if(r.alive && !r.releasing)                                                       // NPC vivo: el ragdoll dura unos segundos
+        {
+            bool timeUp = now >= r.aliveUntil;
+            bool rested = r.asleep && r.sleepT && (now - r.sleepT) > 700;
+            if(timeUp || rested) { r.releasing = true; r.relStart = now; FLog("[ragdoll] liberando NPC vivo slot=%d", i); }
+        }
         if(now != r.lastTime && now - r.lastTime < 200)
         {
             float dt = (now - r.lastTime) * 0.001f;
@@ -925,8 +1245,27 @@ static void RagdollOnHierarchy(void* hier)
             FLog("[ragdoll] posiciones invalidas, se restaura el ultimo estado bueno (fallos=%d)", r.fails);
             if(r.fails >= 4) { r.used = false; continue; }
         }
+        float G[RD_MAXN * 16];                                    // pose del juego, para volver a ella suavemente
+        bool rel = r.releasing;
+        if(rel) memcpy(G, m, r.n * 64);
         RagdollWrite(r);
+        if(rel)
+        {
+            float tt = cfgReleaseTime > 0.01f ? cfgReleaseTime : 0.01f;
+            float w = (now - r.relStart) / (tt * 1000.f);
+            if(w >= 1.f) { memcpy(m, G, r.n * 64); FLog("[ragdoll] NPC vivo liberado slot=%d", i); r.used = false; continue; }
+            static const int idx[12] = { 0,1,2,4,5,6,8,9,10,12,13,14 };
+            for(unsigned k = 0; k < r.n; ++k)
+                for(int j = 0; j < 12; ++j) m[k*16 + idx[j]] = m[k*16 + idx[j]] * (1.f - w) + G[k*16 + idx[j]] * w;
+        }
     }
+}
+
+// un NPC vivo con ragdoll que muere pasa a ragdoll permanente
+static void PromoteRagdoll(void* ped)
+{
+    for(int i = 0; i < RD_SLOTS; ++i)
+        if(g_rd[i].used && g_rd[i].ped == ped && g_rd[i].alive) { g_rd[i].alive = false; g_rd[i].releasing = false; FLog("[ragdoll] el NPC murio: ragdoll permanente slot=%d", i); }
 }
 
 typedef void* (*UpdMat_t)(void*);
@@ -953,7 +1292,8 @@ DECL_HOOK(void*, RpHAnimHierarchyUpdateMatrices_hook, void* hier)
     return r;
 }
 
-struct HitInfo { void* ped; float dx, dy, force; unsigned int time; };
+struct HitInfo { void* ped; float dx, dy, force; unsigned int time; float vel[3]; bool hasVel; };
+static bool IsRagdollActive(void* ped);
 static HitInfo g_info[32];
 static int     g_infoN = 0;
 static void*   g_rdSeen[32];
@@ -971,7 +1311,13 @@ static void OnDying(const char* tag, void* ped, bool isDieTask)
     if(!hi && !isDieTask) return;                                    // cadaver viejo: no tocar
     float dx = hi ? hi->dx : 0.f, dy = hi ? hi->dy : 0.f, f = hi ? hi->force : 8.f;
     if(f < 8.f) f = 8.f;
-    int res = StartRagdoll(ped, dx, dy, f);
+    if(IsRagdollActive(ped))                                         // NPC vivo atropellado que murio: el ragdoll pasa a ser permanente
+    {
+        PromoteRagdoll(ped);
+        g_rdSeen[g_rdSeenN++ & 31] = ped;
+        return;
+    }
+    int res = (hi && hi->hasVel) ? StartRagdollEx(ped, dx, dy, f, false, hi->vel) : StartRagdoll(ped, dx, dy, f);
     if(res == 0) return;                                             // otro ragdoll empezo en este tick: reintenta el siguiente frame
     g_rdSeen[g_rdSeenN++ & 31] = ped;
     if(g_dieLogs++ < 30) FLog("[die] %s ped=%p dir=(%.2f,%.2f) force=%.1f info=%d res=%d", tag, ped, dx, dy, f, hi ? 1 : 0, res);
@@ -1026,6 +1372,23 @@ struct ExpTick { void* ped; unsigned int time; int count; };
 static ExpTick g_exp[16];
 static unsigned int g_tickT = 0; static int g_tickN = 0;
 static bool IsRagdollActive(void* ped) { for(int i = 0; i < RD_SLOTS; ++i) if(g_rd[i].used && g_rd[i].ped == ped) return true; return false; }
+static void WakeRagdollVel(void* ped, const float* tv)
+{
+    for(int i = 0; i < RD_SLOTS; ++i)
+    {
+        Ragdoll& r = g_rd[i];
+        if(!r.used || r.ped != ped || !r.inited) continue;
+        for(unsigned k = 0; k < r.n; ++k)
+        {
+            if(!IsActive((int)k)) continue;
+            float d[3] = { tv[0]*0.016f, tv[1]*0.016f, tv[2]*0.016f };
+            float dl = sqrtf(Dot3(d,d)); if(dl > r.maxStep) { float kk = r.maxStep / dl; d[0]*=kk; d[1]*=kk; d[2]*=kk; }
+            r.pv[k][0] -= d[0]; r.pv[k][1] -= d[1]; r.pv[k][2] -= d[2];
+        }
+        r.asleep = false; r.calm = 0;
+        if(r.alive) { unsigned int tn = pTimeMs ? *pTimeMs : 0; r.aliveUntil = tn + (unsigned int)(cfgAliveTime * 1000.f); r.releasing = false; }
+    }
+}
 static void WakeRagdoll(void* ped, float dx, float dy, float force)
 {
     for(int i = 0; i < RD_SLOTS; ++i)
@@ -1085,17 +1448,35 @@ static void OnHit(const char* tag, void* ped, void* ev)
         FLog("[%s] ped=%p weapon=%d force=%.1f pos=%d/%d atk(%.1f,%.1f) ped(%.1f,%.1f)",
              tag, ped, weapon, force, okP, okA, ap.x, ap.y, pp.x, pp.y);
 
+    float tv[3] = { 0.f, 0.f, 0.f }; bool hasTv = false;
+    float rx = 0.f, ry = 0.f;
+    if(okP && okA) { float dx = pp.x - ap.x, dy = pp.y - ap.y, l = sqrtf(dx*dx + dy*dy); if(l > 0.01f) { rx = dx / l; ry = dy / l; } }
+
+    // ---- ATROPELLO / CHOQUE CON VEHICULO: ragdoll aunque el NPC no muera; la fuerza sale de la velocidad real del vehiculo
+    if((weapon == 49 || weapon == 50) && cfgRunOver && cfgRagdoll)
     {
-        float rx = 0.f, ry = 0.f;
-        if(okP && okA) { float dx = pp.x - ap.x, dy = pp.y - ap.y, l = sqrtf(dx*dx + dy*dy); if(l > 0.01f) { rx = dx / l; ry = dy / l; } }
-        g_info[g_infoN++ & 31] = { ped, rx, ry, force, now };
+        UpdateVehicles(now);
+        VehTrack* t = FindTrack(attacker);
+        float vel[3] = { 0.f, 0.f, 0.f }; bool haveV = false;
+        if(t && now - t->seen < 400) { vel[0] = t->vel[0]; vel[1] = t->vel[1]; vel[2] = t->vel[2]; haveV = true; }
+        float spd = sqrtf(vel[0]*vel[0] + vel[1]*vel[1]);
+        if(!haveV && okP && okA) { vel[0] = rx * 6.0f; vel[1] = ry * 6.0f; spd = 6.0f; }   // sin seguimiento: velocidad estimada
+        if(g_hitLogs < 80) FLog("[atropello] ped=%p vehiculo=%p seguimiento=%d velocidad=%.1f m/s vel=(%.1f,%.1f,%.1f)", ped, attacker, haveV ? 1 : 0, spd, vel[0], vel[1], vel[2]);
+        if(spd >= cfgRunOverMin)
+        {
+            tv[0] = vel[0] * cfgRunOverXfer; tv[1] = vel[1] * cfgRunOverXfer; tv[2] = vel[2] * cfgRunOverXfer;
+            float up = spd * 0.10f; if(up > 3.0f) up = 3.0f; tv[2] += up;
+            float tl = sqrtf(Dot3(tv, tv)); if(tl > 14.0f) { float kk = 14.0f / tl; tv[0] *= kk; tv[1] *= kk; tv[2] *= kk; }
+            if(spd > 0.5f) { rx = vel[0] / spd; ry = vel[1] / spd; }            // el empuje sigue la direccion del vehiculo
+            hasTv = true;
+            g_info[g_infoN++ & 31] = { ped, rx, ry, force, now, { tv[0], tv[1], tv[2] }, true };
+            if(IsRagdollActive(ped)) WakeRagdollVel(ped, tv);
+            else StartRagdollEx(ped, rx, ry, spd * cfgCarM, true, tv);          // NPC vivo: ragdoll temporal
+            return;
+        }
     }
-    if(isDeath && cfgRagdoll)
-    {
-        float rx = 0.f, ry = 0.f;
-        if(okP && okA) { float dx = pp.x - ap.x, dy = pp.y - ap.y, l = sqrtf(dx*dx + dy*dy); if(l > 0.01f) { rx = dx / l; ry = dy / l; } }
-        StartRagdoll(ped, rx, ry, force > 8.0f ? force : 8.0f);
-    }
+    g_info[g_infoN++ & 31] = { ped, rx, ry, force, now, { 0.f, 0.f, 0.f }, false };
+    if(isDeath && cfgRagdoll) StartRagdoll(ped, rx, ry, force > 8.0f ? force : 8.0f);
     if(force >= cfgLight && !IsExplosionWeapon(weapon)) ProbeSkeleton(ped);
     if(force >= cfgLight && cfgBoneTest) StartBoneTest(ped);
     if(force < cfgLight || !okP || !okA) return;
@@ -1129,6 +1510,10 @@ DECL_HOOK(int, CEventDamage_ComputeDamageAnim, void* self, void* ped, bool b)
 DECL_HOOKv(CPed_ProcessControl, void* self)
 {
     CPed_ProcessControl(self);
+    if(pTimeMs && FindPlayerPed && self == FindPlayerPed(0)) UpdateVehicles(*pTimeMs);
+    if(cfgSyncEntity)
+        for(int q = 0; q < RD_SLOTS; ++q)
+            if(g_rd[q].used && g_rd[q].alive && g_rd[q].ped == self) SyncEntity(g_rd[q]);
     if(!ApplyMoveForce) return;
     for(int i = 0; i < 32; ++i)
     {
@@ -1164,7 +1549,18 @@ ON_MOD_LOAD()
     cfgWeaponM = cfg->GetFloat("WeaponMult",  1.0f,  "Settings");
     cfgCarM    = cfg->GetFloat("VehicleMult", 1.0f,  "Settings");
     cfgExplM   = cfg->GetFloat("ExplosionMult", 1.0f, "Settings");
-    cfgPlayer  = cfg->GetBool ("AffectPlayer", false, "Settings");
+    cfgPlayer  = cfg->GetBool ("AffectPlayer2", true, "Settings");
+    cfgRunOver      = cfg->GetBool("RunOverRagdoll", true, "Vehicles");
+    cfgRunOverMin   = cfg->GetFloat("RunOverMinSpeed", 2.5f, "Vehicles");
+    cfgRunOverXfer  = cfg->GetFloat("RunOverTransfer", 0.60f, "Vehicles");
+    cfgAliveTime    = cfg->GetFloat("AliveRagdollTime", 3.5f, "Vehicles");
+    cfgReleaseTime  = cfg->GetFloat("ReleaseBlendTime", 0.35f, "Vehicles");
+    cfgSyncEntity   = cfg->GetBool("SyncEntityToBody", true, "Vehicles");
+    cfgVehCollision = cfg->GetBool("VehicleCollision", true, "Vehicles");
+    cfgKneeSpring   = cfg->GetFloat("RagdollKneeSpring", 0.004f, "Settings");
+    if(cfgRunOverXfer < 0.1f) cfgRunOverXfer = 0.1f; if(cfgRunOverXfer > 1.0f) cfgRunOverXfer = 1.0f;
+    if(cfgAliveTime < 1.0f) cfgAliveTime = 1.0f; if(cfgAliveTime > 10.0f) cfgAliveTime = 10.0f;
+    if(cfgKneeSpring < 0.f) cfgKneeSpring = 0.f; if(cfgKneeSpring > 0.03f) cfgKneeSpring = 0.03f;
     cfgLog     = cfg->GetBool ("WriteLog",    true,  "Settings");
     cfgBoneTest = cfg->GetBool("BoneTest",    false, "Settings");
     cfgMaxImpulse  = cfg->GetFloat("MaxImpulseLimit", 2.0f, "Safety");
@@ -1173,7 +1569,7 @@ ON_MOD_LOAD()
     cfgSafeReads   = cfg->GetBool("SafeMemoryReads", true, "Safety");
     cfgLenLock     = cfg->GetBool("RagdollLengthLock", true, "Settings");
     cfgLegPasses   = (int)cfg->GetFloat("RagdollLegPasses", 4.0f, "Settings");
-    cfgLegDamp     = cfg->GetFloat("RagdollLegDamping", 0.25f, "Settings");
+    cfgLegDamp     = cfg->GetFloat("RagdollLegDamp2", 0.35f, "Settings");
     cfgSpineStiff  = cfg->GetFloat("RagdollSpineStiffness", 0.9f, "Settings");
     cfgRdBodyScale = cfg->GetFloat("RagdollBodyScale", 1.0f, "Settings");
     if(cfgRdBodyScale < 0.5f) cfgRdBodyScale = 0.5f; if(cfgRdBodyScale > 1.5f) cfgRdBodyScale = 1.5f;
@@ -1202,6 +1598,8 @@ ON_MOD_LOAD()
     SETSYM_TO(GetAnimHierarchyFromFrame, hGTASA, "_Z25GetAnimHierarchyFromFrameP7RwFrame");
     SETSYM_TO(GetBonePosition,           hGTASA, "_ZN4CPed15GetBonePositionER5RwV3djb");
     SETSYM_TO(FindGroundZFor3DCoord,     hGTASA, "_ZN6CWorld21FindGroundZFor3DCoordEfffPbPP7CEntity");
+    SETSYM_TO(FindObjectsInRange,        hGTASA, "_ZN6CWorld18FindObjectsInRangeERK7CVectorfbPssPP7CEntitybbbbb");
+    pModelInfoPtrs = (void**)aml->GetSym(hGTASA, "_ZN10CModelInfo16ms_modelInfoPtrsE");
     SET_TO(pTimeMs, aml->GetSym(hGTASA, "_ZN6CTimer22m_snTimeInMillisecondsE"));
 
     const char* sC1 = "_ZN12CEventDamageC1EP7CEntityj11eWeaponType14ePedPieceTypeshbb";
