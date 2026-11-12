@@ -25,6 +25,24 @@ END_DEPLIST()
 
 struct CVector { float x, y, z; };
 
+// ---- Desplazamientos que dependen del tamano del puntero ----
+//  32 bits (GTA SA 2.00): verificados con los logs de tu juego.
+//  64 bits (GTA SA 2.10): derivados de las reglas de alineacion de C++ (vtable de 8 bytes, punteros de 8) y de RenderWare 3.7;
+//                         el mod los valida al arrancar y escribe en el log "[arch]" lo que encuentra.
+struct ArchOff
+{
+    int matrix;        // CPlaceable::m_matrix (puntero a CMatrix)
+    int placePos;      // CPlaceable::m_placement.pos
+    int rwObj;         // CEntity::m_pRwObject (RpClump*)
+    int clumpParent;   // RpClump.object.parent (RwFrame*)
+    int hierNodeInfo;  // RpHAnimHierarchy::pNodeInfo
+    int nodeStride;    // sizeof(RpHAnimNodeInfo)
+};
+static const ArchOff A = (sizeof(void*) == 8) ? ArchOff{ 0x18, 0x08, 0x20, 8, 24, 24 } : ArchOff{ 0x14, 0x04, 0x18, 4, 16, 16 };
+// CEventDamage: atacante y arma. En 32 bits son fijos; en 64 bits se calibran con los argumentos del constructor.
+static int g_evAtk = (sizeof(void*) == 8) ? -1 : 0x10;
+static int g_evWpn = (sizeof(void*) == 8) ? -1 : 0x18;
+
 // ---------------------------------------------------------------- simbolos
 typedef void  (*ApplyMoveForce_t)(void* self, CVector force);
 typedef void* (*FindPlayerPed_t)(int);
@@ -129,9 +147,9 @@ static bool IsValidPed(void* ped) { return ValidPtr(ped) && (((uintptr_t)ped) & 
 static bool GetPos(void* ent, CVector& out)
 {
     if(!ValidPtr(ent) || (((uintptr_t)ent) & 3) != 0 || !CanRead(ent, 0x20)) return false;
-    void* mtx = *(void**)((char*)ent + 0x14);
+    void* mtx = *(void**)((char*)ent + A.matrix);
     if(ValidPtr(mtx) && CanRead(mtx, 0x40)) out = *(CVector*)((char*)mtx + 0x30);
-    else                                    out = *(CVector*)((char*)ent + 0x04);
+    else                                    out = *(CVector*)((char*)ent + A.placePos);
     return InWorld(out.x, out.y, out.z);
 }
 
@@ -196,6 +214,34 @@ static void StartStagger(void* ped, float dx, float dy, float force)
 
 // ---------------------------------------------------------------- hooks
 static int g_ctorCalls = 0, g_copyCalls = 0;
+static int g_evVotesA[48], g_evVotesW[48], g_evNA = 0, g_evNW = 0, g_evLastW = -999, g_evDistinctW = 0;
+static void CalibrateEvent(void* self, void* attacker, int weapon)
+{
+    if(g_evAtk >= 0 && g_evWpn >= 0) return;
+    if(!ValidPtr(self) || !CanRead(self, 0xC0)) return;
+    const int ps = (int)sizeof(void*);
+    if(ValidPtr(attacker)) { ++g_evNA; for(int off = 8; off < 0xC0; off += ps) if(*(void**)((char*)self + off) == attacker) ++g_evVotesA[off / 4]; }
+    if(weapon >= 0 && weapon < 60)
+    {
+        ++g_evNW; if(weapon != g_evLastW) { ++g_evDistinctW; g_evLastW = weapon; }
+        for(int off = 8; off < 0xC0; off += 4) if(*(int*)((char*)self + off) == weapon) ++g_evVotesW[off / 4];
+    }
+    if(g_evNA >= 4 && g_evNW >= 8 && g_evDistinctW >= 3)
+    {
+        int bestA = -1, bestW = -1, maxA = 0, maxW = 0, tiesA = 0, tiesW = 0;
+        for(int i = 0; i < 48; ++i)
+        {
+            if(g_evVotesA[i] > maxA) { maxA = g_evVotesA[i]; bestA = i * 4; tiesA = 0; } else if(g_evVotesA[i] == maxA && maxA > 0) ++tiesA;
+            if(g_evVotesW[i] > maxW) { maxW = g_evVotesW[i]; bestW = i * 4; tiesW = 0; } else if(g_evVotesW[i] == maxW && maxW > 0) ++tiesW;
+        }
+        if(bestA >= 0 && maxA >= g_evNA && bestW >= 0 && maxW >= g_evNW - 1 && tiesA == 0 && tiesW == 0)
+        {
+            g_evAtk = bestA; g_evWpn = bestW;
+            FLog("[arch] CEventDamage calibrado: atacante +0x%X (%d/%d) arma +0x%X (%d/%d)", g_evAtk, maxA, g_evNA, g_evWpn, maxW, g_evNW);
+        }
+        else if(g_evNW > 40) { g_evNW = 0; memset(g_evVotesA, 0, sizeof(g_evVotesA)); memset(g_evVotesW, 0, sizeof(g_evVotesW)); g_evNA = 0; g_evDistinctW = 0; }
+    }
+}
 
 static void RecordEvent(void* self, void* attacker, int weapon, int piece)
 {
@@ -203,6 +249,7 @@ static void RecordEvent(void* self, void* attacker, int weapon, int piece)
     r.self = self; r.attacker = attacker; r.weapon = weapon; r.piece = piece;
     r.time = pTimeMs ? *pTimeMs : 0;
     if(g_ctorCalls++ < 12) FLog("[ctor] evento=%p attacker=%p weapon=%d piece=%d", self, attacker, weapon, piece);
+    CalibrateEvent(self, attacker, weapon);
 }
 
 DECL_HOOKv(CEventDamage_ctor, void* self, void* attacker, unsigned int t, int weapon, int piece, unsigned char dir, bool b1, bool b2)
@@ -243,9 +290,10 @@ DECL_HOOKv(CEventDamage_copy2, void* self, void* src)
 //   +0x10 = atacante (CEntity*), +0x18 = eWeaponType, +0x1C = pieza del cuerpo
 static bool ReadEvent(void* ev, int& weapon, void*& attacker)
 {
-    if(!ValidPtr(ev) || (((uintptr_t)ev) & 3) != 0 || !CanRead(ev, 0x30)) return false;
-    weapon   = *(int*)((char*)ev + 0x18);
-    attacker = *(void**)((char*)ev + 0x10);
+    if(g_evAtk < 0 || g_evWpn < 0) return false;                       // 64 bits: aun sin calibrar (se usa el plan B)
+    if(!ValidPtr(ev) || (((uintptr_t)ev) & 3) != 0 || !CanRead(ev, 0x60)) return false;
+    weapon   = *(int*)((char*)ev + g_evWpn);
+    attacker = *(void**)((char*)ev + g_evAtk);
     return weapon >= 0 && weapon < 60;
 }
 
@@ -258,9 +306,10 @@ static int     g_hitLogs = 0;
 static void* GetPedHierarchyEx(void* ped, void** outClump, void** outFrame)
 {
     if(!IsValidPed(ped)) return NULL;
-    void* clump = *(void**)((char*)ped + 0x18);
+    void* clump = *(void**)((char*)ped + A.rwObj);
     if(!ValidPtr(clump) || !CanRead(clump, 0x10)) return NULL;
-    void* frame = *(void**)((char*)clump + 4);
+    if(*(unsigned char*)clump != 2) return NULL;                       // RwObject.type de un RpClump = 2 (verificado en tus logs)
+    void* frame = *(void**)((char*)clump + A.clumpParent);
     if(!ValidPtr(frame) || !CanRead(frame, 0x20) || !GetAnimHierarchyFromFrame) return NULL;
     void* hier = GetAnimHierarchyFromFrame(frame);
     if(!ValidPtr(hier) || !CanRead(hier, 0x24)) return NULL;
@@ -419,7 +468,7 @@ static bool PlausibleBox(const float* b)
 static bool ReadVehBox(void* veh, float* mn, float* mx)
 {
     if(!pModelInfoPtrs) return false;
-    static const int entOffs[] = { 0x22, 0x26, 0x24, 0x20, 0x28, 0x2A };
+    static const int entOffs[] = { 0x22, 0x26, 0x24, 0x20, 0x28, 0x2A, 0x2E, 0x32, 0x30, 0x2C, 0x34, 0x36 };   // 32 bits: 0x22 / 64 bits: se calibra
     for(unsigned a = 0; a < sizeof(entOffs)/sizeof(entOffs[0]); ++a)
     {
         int eo = entOffs[a];
@@ -428,7 +477,7 @@ static bool ReadVehBox(void* veh, float* mn, float* mx)
         if(mi == 0 || mi >= 20000) continue;
         void* info = pModelInfoPtrs[mi];
         if(!ValidPtr(info) || (((uintptr_t)info) & 3) || !CanRead(info, 0x60)) continue;
-        for(int co = 0x08; co <= 0x40; co += 4)
+        for(int co = 0x08; co <= 0x60; co += (int)sizeof(void*))
         {
             if(g_colOff >= 0 && co != g_colOff) continue;
             void* col = *(void**)((char*)info + co);
@@ -464,7 +513,7 @@ static void UpdateVehicles(unsigned int now)
     {
         void* e = list[i];
         if(!ValidPtr(e) || (((uintptr_t)e) & 3) || !CanRead(e, 0x60)) continue;
-        void* m = *(void**)((char*)e + 0x14);
+        void* m = *(void**)((char*)e + A.matrix);
         if(!ValidPtr(m) || (((uintptr_t)m) & 3) || !CanRead(m, 0x40)) continue;
         const float* f = (const float*)m;
         if(!InWorld(f[12], f[13], f[14])) continue;
@@ -594,6 +643,7 @@ struct Ragdoll
     void* clump; void* frame;    // cadena ped->clump->frame guardada al empezar (validacion sin llamar al juego)
     float dk[RD_MAXN];           // amortiguacion de cada particula
     int   dbg;                   // pasos registrados en el log
+    float dtPrev;                // duracion del paso anterior (integracion de Verlet con dt variable)
     bool  alive, releasing, hasVel; unsigned int aliveUntil, relStart, sleepT;
     float vel0[3];               // velocidad inicial (m/s) transferida por un atropello
     float maxStep;               // tope de desplazamiento por paso de este ragdoll
@@ -657,13 +707,13 @@ static void RagdollInit(Ragdoll& r)
     unsigned int* h = (unsigned int*)r.hier;
     unsigned int n = h[1];
     float* m = *(float**)(h + 2);
-    unsigned char* ni = *(unsigned char**)(h + 4);          // RpHAnimNodeInfo[] (16 bytes c/u)
+    unsigned char* ni = *(unsigned char**)((char*)r.hier + A.hierNodeInfo);   // RpHAnimNodeInfo[] (16 bytes en 32 bits, 24 en 64)
     if(!ValidPtr(m) || !ValidPtr(ni) || n != 32) { r.used = false; FLog("[ragdoll] esqueleto inesperado n=%u", n); return; }
     // comprobar que la jerarquia coincide con la tabla (banderas PUSH=2 / POP=1)
     int stack[RD_MAXN]; int sp = 0; int cur = -1; bool ok = true;
     for(unsigned i = 0; i < n; ++i)
     {
-        int flags = *(int*)(ni + i*16 + 8);
+        int flags = *(int*)(ni + i*A.nodeStride + 8);
         if(flags & 2) { if(sp < RD_MAXN) stack[sp++] = cur; }
         if(cur != kParent[i]) ok = false;
         cur = (int)i;
@@ -860,7 +910,9 @@ static void RagdollStep(Ragdoll& r, float dt, unsigned int now)
     {
         if(!IsActive((int)i)) continue;
         float vel[3];
-        for(int k = 0; k < 3; ++k) vel[k] = (r.p[i][k] - r.pv[i][k]) * r.dk[i];
+        float kdt = dt / (r.dtPrev > 0.001f ? r.dtPrev : 0.016f);       // corrige la velocidad si el paso cambio de duracion
+        if(kdt < 0.25f) kdt = 0.25f; if(kdt > 4.0f) kdt = 4.0f;
+        for(int k = 0; k < 3; ++k) vel[k] = (r.p[i][k] - r.pv[i][k]) * r.dk[i] * kdt;
         float vl = sqrtf(Dot3(vel, vel));                       // tope de velocidad (explosiones, impulsos enormes)
         if(!(vl == vl)) { vel[0] = vel[1] = vel[2] = 0.f; vl = 0.f; }
         float mxs = r.maxStep > 0.f ? r.maxStep : cfgRdMaxStep;
@@ -870,6 +922,7 @@ static void RagdollStep(Ragdoll& r, float dt, unsigned int now)
         if(w > 0.f)                                   // al principio sigue la animacion del juego (intenta mantenerse)
             for(int k = 0; k < 3; ++k) r.p[i][k] += (r.T[i][k] - r.p[i][k]) * 0.35f * w;
     }
+    r.dtPrev = dt;
     // amortiguacion articular: frena la velocidad relativa entre huesos conectados (evita el efecto gelatina)
     if(cfgRdJointDamp > 0.f)
         for(int c = 0; c < r.nc; ++c)
@@ -1193,10 +1246,10 @@ static bool VehicleWakes(Ragdoll& r, unsigned int now)
 static void SyncEntity(Ragdoll& r)
 {
     if(!r.entOk || !r.inited || !IsValidPed(r.ped)) return;
-    void* mtx = *(void**)((char*)r.ped + 0x14);
+    void* mtx = *(void**)((char*)r.ped + A.matrix);
     float* dst = NULL;
     if(ValidPtr(mtx) && (((uintptr_t)mtx) & 3) == 0 && CanRead(mtx, 0x40)) dst = (float*)((char*)mtx + 0x30);
-    else if(CanRead(r.ped, 0x20)) dst = (float*)((char*)r.ped + 0x04);
+    else if(CanRead(r.ped, 0x30)) dst = (float*)((char*)r.ped + A.placePos);
     if(!dst) return;
     float nx = r.p[1][0] + r.entOff[0], ny = r.p[1][1] + r.entOff[1];
     if(!InWorld(nx, ny, dst[2])) return;
@@ -1212,8 +1265,8 @@ static void RagdollOnHierarchy(void* hier)
         if(!r.used || r.hier != hier) continue;
         if(!IsValidPed(r.ped)) { FLog("[ragdoll] fin (ped invalido) slot=%d", i); r.used = false; continue; }
         {   // el ped sigue siendo el mismo? ped -> clump -> frame se comparan con lo guardado (solo lecturas, sin llamar al juego)
-            void* cl = *(void**)((char*)r.ped + 0x18);
-            bool same = (cl == r.clump) && ValidPtr(cl) && CanRead(cl, 8) && (*(void**)((char*)cl + 4) == r.frame);
+            void* cl = *(void**)((char*)r.ped + A.rwObj);
+            bool same = (cl == r.clump) && ValidPtr(cl) && CanRead(cl, 16) && (*(void**)((char*)cl + A.clumpParent) == r.frame);
             if(!same) { FLog("[ragdoll] fin (ped liberado) slot=%d", i); r.used = false; continue; }
         }
         if(!r.inited) { RagdollInit(r); if(!r.used) continue; }
@@ -1231,9 +1284,14 @@ static void RagdollOnHierarchy(void* hier)
         if(now != r.lastTime && now - r.lastTime < 200)
         {
             float dt = (now - r.lastTime) * 0.001f;
-            if(dt > 0.04f) dt = 0.04f;
-            if(r.dbg < 4) FLog("[ragdoll] slot=%d paso %d inicio dt=%.3f", i, r.dbg, dt);     // migas de pan: si el juego se cierra, se ve donde
-            if(!r.asleep) RagdollStep(r, dt, now);
+            if(dt > 0.05f) dt = 0.05f;
+            // sub-pasos: siempre al menos uno por frame (el coche se mueve cada frame) y ninguno mayor de 20 ms.
+            // La integracion corrige el cambio de dt entre pasos, asi que es estable a 30, 60 o 120 FPS.
+            int nsteps = (int)ceilf(dt / 0.02f);
+            if(nsteps < 1) nsteps = 1; if(nsteps > 3) nsteps = 3;
+            dt = dt / (float)nsteps;
+            if(r.dbg < 4) FLog("[ragdoll] slot=%d paso %d inicio pasos=%d", i, r.dbg, nsteps);     // migas de pan: si el juego se cierra, se ve donde
+            for(int st = 0; st < nsteps && !r.asleep; ++st) RagdollStep(r, dt, now);
             if(r.dbg < 4) { FLog("[ragdoll] slot=%d paso %d fin pelvis=(%.2f,%.2f,%.2f) suelo=%.2f", i, r.dbg, r.p[1][0], r.p[1][1], r.p[1][2], r.gz[1]); ++r.dbg; }
         }
         r.lastTime = now;
@@ -1339,10 +1397,10 @@ static void ProbeSkeleton(void* ped)
 {
     static int n = 0;
     if(n++ >= 3) return;
-    void* clump = *(void**)((char*)ped + 0x18);               // CEntity::m_pRwObject
+    void* clump = *(void**)((char*)ped + A.rwObj);            // CEntity::m_pRwObject
     FLog("[skel] ped=%p clump=%p", ped, clump);
-    if(!ValidPtr(clump)) return;
-    void* frame = *(void**)((char*)clump + 4);                // RpClump.object.parent = RwFrame*
+    if(!ValidPtr(clump) || !CanRead(clump, 16)) return;
+    void* frame = *(void**)((char*)clump + A.clumpParent);    // RpClump.object.parent = RwFrame*
     FLog("[skel] rwtype=%d frame=%p", (int)*(unsigned char*)clump, frame);
     if(!ValidPtr(frame) || !GetAnimHierarchyFromFrame) return;
     void* hier = GetAnimHierarchyFromFrame(frame);
@@ -1609,19 +1667,26 @@ ON_MOD_LOAD()
     uintptr_t aC1 = aml->GetSym(hGTASA, sC1), aC2 = aml->GetSym(hGTASA, sC2);
     uintptr_t aK1 = aml->GetSym(hGTASA, sK1), aK2 = aml->GetSym(hGTASA, sK2);
     FLog("[sym] ctor C1=%p C2=%p copy C1=%p C2=%p", (void*)aC1, (void*)aC2, (void*)aK1, (void*)aK2);
-    HOOKSYM(CEventDamage_ctor, hGTASA, sC1);
+    if(aC1) { HOOKSYM(CEventDamage_ctor, hGTASA, sC1); }
     if(aC2 && aC2 != aC1) { HOOKSYM(CEventDamage_ctor2, hGTASA, sC2); }
-    HOOKSYM(CEventDamage_copy, hGTASA, sK1);
+    if(aK1) { HOOKSYM(CEventDamage_copy, hGTASA, sK1); }
     if(aK2 && aK2 != aK1) { HOOKSYM(CEventDamage_copy2, hGTASA, sK2); }
-    HOOKSYM(CEventDamage_ComputeDamageAnim, hGTASA, "_ZN12CEventDamage17ComputeDamageAnimEP4CPedb");
-    HOOKSYM(CEH_ComputeDamageResponse, hGTASA, "_ZN13CEventHandler21ComputeDamageResponseEP6CEventP5CTaskS3_S3_");
-    HOOKSYM(CEH_ComputeDeathResponse,  hGTASA, "_ZN13CEventHandler20ComputeDeathResponseEP6CEventP5CTaskS3_");
-    HOOKSYM(CTaskSimpleDie_ProcessPed,  hGTASA, "_ZN14CTaskSimpleDie10ProcessPedEP4CPed");
-    HOOKSYM(CTaskSimpleDead_ProcessPed, hGTASA, "_ZN15CTaskSimpleDead10ProcessPedEP4CPed");
-    HOOKSYM(CPed_ProcessControl,            hGTASA, "_ZN4CPed14ProcessControlEv");
-    HOOKSYM(RpHAnimHierarchyUpdateMatrices_hook, hGTASA, "_Z30RpHAnimHierarchyUpdateMatricesP16RpHAnimHierarchy");
+    if(aml->GetSym(hGTASA, "_ZN12CEventDamage17ComputeDamageAnimEP4CPedb")) { HOOKSYM(CEventDamage_ComputeDamageAnim, hGTASA, "_ZN12CEventDamage17ComputeDamageAnimEP4CPedb"); } else FLog("[sym] NO ENCONTRADO: _ZN12CEventDamage17ComputeDamageAnimEP4CPedb");
+    if(aml->GetSym(hGTASA, "_ZN13CEventHandler21ComputeDamageResponseEP6CEventP5CTaskS3_S3_")) { HOOKSYM(CEH_ComputeDamageResponse, hGTASA, "_ZN13CEventHandler21ComputeDamageResponseEP6CEventP5CTaskS3_S3_"); } else FLog("[sym] NO ENCONTRADO: _ZN13CEventHandler21ComputeDamageResponseEP6CEventP5CTaskS3_S3_");
+    if(aml->GetSym(hGTASA, "_ZN13CEventHandler20ComputeDeathResponseEP6CEventP5CTaskS3_")) { HOOKSYM(CEH_ComputeDeathResponse, hGTASA, "_ZN13CEventHandler20ComputeDeathResponseEP6CEventP5CTaskS3_"); } else FLog("[sym] NO ENCONTRADO: _ZN13CEventHandler20ComputeDeathResponseEP6CEventP5CTaskS3_");
+    if(aml->GetSym(hGTASA, "_ZN14CTaskSimpleDie10ProcessPedEP4CPed")) { HOOKSYM(CTaskSimpleDie_ProcessPed, hGTASA, "_ZN14CTaskSimpleDie10ProcessPedEP4CPed"); } else FLog("[sym] NO ENCONTRADO: _ZN14CTaskSimpleDie10ProcessPedEP4CPed");
+    if(aml->GetSym(hGTASA, "_ZN15CTaskSimpleDead10ProcessPedEP4CPed")) { HOOKSYM(CTaskSimpleDead_ProcessPed, hGTASA, "_ZN15CTaskSimpleDead10ProcessPedEP4CPed"); } else FLog("[sym] NO ENCONTRADO: _ZN15CTaskSimpleDead10ProcessPedEP4CPed");
+    if(aml->GetSym(hGTASA, "_ZN4CPed14ProcessControlEv")) { HOOKSYM(CPed_ProcessControl, hGTASA, "_ZN4CPed14ProcessControlEv"); } else FLog("[sym] NO ENCONTRADO: _ZN4CPed14ProcessControlEv");
+    if(aml->GetSym(hGTASA, "_Z30RpHAnimHierarchyUpdateMatricesP16RpHAnimHierarchy")) { HOOKSYM(RpHAnimHierarchyUpdateMatrices_hook, hGTASA, "_Z30RpHAnimHierarchyUpdateMatricesP16RpHAnimHierarchy"); } else FLog("[sym] NO ENCONTRADO: _Z30RpHAnimHierarchyUpdateMatricesP16RpHAnimHierarchy");
 
-    FLog("=== GTA4 Ragdoll Android 0.1 cargado. base=0x%X ApplyMoveForce=%p FindPlayerPed=%p timer=%p",
-         (unsigned)pGTASA, (void*)ApplyMoveForce, (void*)FindPlayerPed, (void*)pTimeMs);
+    FLog("=== GTA4 Ragdoll Android cargado (%d bits). base=%p ApplyMoveForce=%p FindPlayerPed=%p timer=%p",
+         (int)(sizeof(void*) * 8), (void*)pGTASA, (void*)ApplyMoveForce, (void*)FindPlayerPed, (void*)pTimeMs);
+    {   // lista de lo que NO se encontro en esta version del juego (cada funcion que falte desactiva su parte del mod)
+        struct { const char* n; const void* p; } need[] = {
+            {"ApplyMoveForce", (const void*)ApplyMoveForce}, {"FindPlayerPed", (const void*)FindPlayerPed}, {"CTimer::m_snTimeInMilliseconds", (const void*)pTimeMs},
+            {"GetAnimHierarchyFromFrame", (const void*)GetAnimHierarchyFromFrame}, {"GetBonePosition", (const void*)GetBonePosition},
+            {"FindGroundZFor3DCoord", (const void*)FindGroundZFor3DCoord}, {"FindObjectsInRange", (const void*)FindObjectsInRange}, {"ms_modelInfoPtrs", (const void*)pModelInfoPtrs} };
+        for(unsigned i = 0; i < sizeof(need)/sizeof(need[0]); ++i) if(!need[i].p) FLog("[sym] NO ENCONTRADO: %s", need[i].n);
+    }
     logger->Info("Cargado. ApplyMoveForce=%p", (void*)ApplyMoveForce);
 }
